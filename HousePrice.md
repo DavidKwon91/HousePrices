@@ -15,7 +15,4 @@ House Price Prediction - Regression
 ==================
 
 Import Dataset
-```{r Import}
 
-
-```
