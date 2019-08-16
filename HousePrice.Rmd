@@ -14,8 +14,3292 @@ editor_options:
 House Price Prediction - Regression
 ==================
 
+
+
+
 Import Dataset
+--------------------
 ```{r Import}
+library(plyr) #must import plyr first than dplyr - confliction issue
+library(dplyr) #dplyr pipelines
+library(caret) #cv / model train / BoxCoxtrans
+library(ggplot2) #ggplot - visualization
+library(gridExtra) #grid.arrange
+library(tidyr)
+library(purrr) #keep
+library(randomForest) #random forest
+library(corrplot) #corrplot
+library(e1071) #skewness / kurtosis
+library(car) #vif
+library(glmnet) #ridge/lasso/elastic net
+library(xgboost) #xgboost
+
+#setting address
+#setwd("~/Desktop/Practice/Kaggle/Housing/HousePrices/Datasets")
+
+#import datasets
+train <- read.csv("Datasets/train.csv", stringsAsFactors = FALSE)
+test <- read.csv("Datasets/test.csv", stringsAsFactors = FALSE)
+
+#creating response variable in test set
+test$SalePrice <- NA
+
+#combine train and test
+dat <- rbind(train,test)
+
+#remove ID
+dat <- dat %>% subset(select = -c(Id))
+
+#convert the MSSubClass as factor - type of dwelling
+dat <- dat %>% mutate(MSSubClass = as.factor(MSSubClass))
+
+#summary
+dat %>% mutate_if(is.character, as.factor) %>% summary
 
 
 ```
+
+
+Sale Price Density
+------------------
+```{r EDA}
+
+#Visualization for our target variable 
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=SalePrice)) +
+  geom_density(fill="green", alpha=0.3)+
+  geom_vline(xintercept = mean(dat$SalePrice,na.rm=TRUE), show.legend = TRUE, color = "red")+
+  geom_vline(xintercept = median(dat$SalePrice, na.rm=TRUE), show.legend = TRUE, color = "blue")+
+  labs(title = "Density for Sales Price", x="Sale Price", y="Density")
+
+#Quite right skewed distribution
+
+summary(dat$SalePrice)
+
+
+```
+
+
+Dealing with NA values
+---------------------
+```{r NA.values}
+#Let's see NA values
+NAtable <- data.frame(dat %>% summarise_all(list(~sum(is.na(.)))))
+
+NAtable <- NAtable[,which(NAtable>0)]
+NAtable <- NAtable %>% subset(select = -c(SalePrice))
+dim(NAtable)
+#total 34 predictors have at least 1 missing values (NA)
+NAtable <- NAtable[order(NAtable, decreasing=TRUE)]
+
+NAtable
+#notice 
+#Alley has 2721 NA
+#FireplaceQu 1420 NA
+#PoolQC 2909 NA
+#Fence 2348 NA
+#MiscFeature 2814 NA
+#out of total 2919 observations
+
+#I'm going to deal with those predictors that have NA values first
+
+```
+
+
+Alley NA values
+-------------------
+```{r AlleyNA}
+
+summary(as.factor(dat$Alley))
+#Alley: Type of alley access to property
+#Grvl : Gravel
+#Pave : Paved
+#NA : no alley access
+
+dat$Alley[is.na(dat$Alley)] <- "no alley"
+dat$Alley[dat$Alley=="Grvl"] <- "Gravel"
+dat$Alley[dat$Alley=="Pave"] <- "Paved"
+
+summary(as.factor(dat$Alley))
+```
+
+
+FireplaceQu NA values
+-------------------
+```{r FireplaceQuNA}
+
+summary(as.factor(dat$FireplaceQu))
+#FireplaceQu: Fireplace quality
+#Ex : Excellent
+#Fa : Fair
+#Gd : Good
+#Po : Poor
+#TA : Average
+#NA : no fire place
+
+dat$FireplaceQu[is.na(dat$FireplaceQu)] <- "no fireplace"
+
+
+summary(as.factor(dat$FireplaceQu))
+```
+
+PoolQC NA values
+-----------------
+```{r PoolQCNA}
+summary(as.factor(dat$PoolQC))
+#PoolQC: Pool quality
+#NA : no pool
+
+dat$PoolQC[is.na(dat$PoolQC)] <- "no pool"
+
+summary(as.factor(dat$PoolQC))
+```
+
+Fence NA values
+-----------------
+```{r FenceNA}
+summary(as.factor(dat$Fence))
+#Fence: Fence quality
+#NA : no fence
+
+dat$Fence[is.na(dat$Fence)] <- "no fence"
+summary(as.factor(dat$Fence))
+
+```
+
+
+MiscFeature NA values
+----------------------
+```{r MiscFeatureNA}
+summary(as.factor(dat$MiscFeature))
+#MiscFeature: Miscellaneous feature not covered in other categories
+#NA : None
+
+dat$MiscFeature[is.na(dat$MiscFeature)] <- "None"
+summary(as.factor(dat$MiscFeature))
+```
+
+Creating Functions
+------------------------
+```{r functions}
+
+#num var vs factors varaibles
+#Finding significant factor variables with numeric variables by lm - anova, 
+#removing the insignificant factor varibles, 
+#then implementing variables importance by random forest with those significant variables
+
+#This function is created to fill the NA values 
+#with the group mean values of the numeric variables 
+#by the most signifcant factor variables
+
+relationship.test.num <- function(test.var, data){
+  
+  #only selecting factor variables
+  variables <- data[,!colnames(data) %in% c(test.var)] %>% 
+    mutate_if(is.character, as.factor) %>% 
+    select_if(is.factor) %>% 
+    colnames
+  
+  #creating formula for anova
+  formula <- as.formula(paste(test.var, "~", paste(variables, collapse = "+")))
+  
+  #First do anova test to get factor variables
+  aov <- aov(formula, dat %>% mutate_if(is.character, as.factor))
+  
+  #removing variables from anova test to make simple
+  variables1 <- 
+    variables[variables %in% 
+                gsub(" ", "",
+                     rownames(summary(aov)[[1]])[which(summary(aov)[[1]][["Pr(>F)"]]<0.05)])]
+  #less than 0.05 p values from anova
+
+  #formula with new variables
+  formula1 <- as.formula(paste(test.var, "~", paste(variables1, collapse = "+")))
+
+  #a quick random forest for variable importance, test.var as response variables, 
+  a <- randomForest(formula1, data %>% 
+                      filter(complete.cases(.),) %>% 
+                      mutate_if(is.character, as.factor))
+  
+  return(importance(a))
+  
+}
+
+#which return the variable importance
+
+
+
+#This function is created to see the relationship between different types of variables
+
+#For factor vs factor : 
+#implement chisq test : 
+#Null H0 = there is no significant difference between observed and expected values
+#which means each variables are independent 
+
+#For factor vs numeric :
+#anova test which is the same with the created function, relationship.test.num, above
+#Null H0 = at least a group mean is different than other group means
+#association between factor and numeric variables
+
+#For numeric vs numeric :
+#correlation : if correlation value is greater than 0.5, 
+#it is generally considered as high correlation between each other
+
+relationship.test <- function(variables, dummy.data, data){
+
+  for(i in variables){
+    for(j in variables){
+      
+      #factor vs factor : chisq.test
+      if(is.factor(data[,i])){
+        if(is.factor(data[,j])){
+          dummy.data[dummy.data$cols == i,j] <- 
+            round(chisq.test(data[,i], data[,j], simulate.p.value = TRUE)$p.value,3)
+          }
+      }
+      #returns p value from chisq test
+      
+      
+      #factor vs numeric : anova
+      if(is.factor(data[,i])){
+        if(is.numeric(data[,j])){
+          dummy.data[dummy.data$cols == i,j] <-
+            round(summary(aov(data[,j]~data[,i]))[[1]][["Pr(>F)"]][[1]],3)
+          }
+      }
+      if(is.numeric(data[,i])){
+        if(is.factor(data[,j])){
+          dummy.data[dummy.data$cols == i,j] <- 
+            round(summary(aov(data[,i]~data[,j]))[[1]][["Pr(>F)"]][[1]],3)
+          }
+      }
+      #returns p value from anova test
+    
+      
+      
+      
+      #numeric vs numeric : correlation
+      if(is.numeric(data[,i])){
+        if(is.numeric(data[,j])){
+          dummy.data[dummy.data$cols == i,j] <- round(cor(data[,i], data[,j]),3)
+          }
+      }
+      
+      #returns correlation values
+    }
+    
+  }
+  
+  return(dummy.data)
+}
+#returns a table for the relationship between each variables
+
+
+
+#Prop table
+#This function is created to see the proportion of each factor levels
+prop.func <- function(var){
+  return(prop.table(matrix(table(dat[,var]))))
+}
+
+
+
+#Year to decade
+#This function converts the year to the decade of year
+floor_decade <- function(year){
+  return(year - year %% 10) 
+}
+
+
+
+#This function will show how a variable looks like and 
+#how a variable has different shapes of distribution between in the train and in the test set
+train.test.graph <- function(var, data){
+  
+  #for categorical variables, bar graphs
+  if(class(data[,var]) == "character" | class(dat[,var]) == "factor"){
+    var1 <- data[!is.na(data$SalePrice),var]
+    var2 <- data[is.na(data$SalePrice),var]
+    
+    #train
+    fac.train <- data %>% filter(!is.na(SalePrice)) %>%
+      ggplot(aes(x=var1, fill=var1)) + geom_bar() + labs(title = "Train", x = var)
+    #test
+    fac.test <- data %>% filter(is.na(SalePrice)) %>%
+      ggplot(aes(x=var2, fill=var2)) + geom_bar() + labs(title = "Test", x = var)
+  
+  return(grid.arrange(fac.train, fac.test))
+  }
+  
+  #for continuous variables, density graphs
+  if(class(data[,var]) == "numeric" | class(data[,var]) == "integer"){
+    var1 <- data[!is.na(data$SalePrice),var]
+    var2 <- data[is.na(data$SalePrice),var]
+    
+    #train
+    num.train <- data %>% filter(!is.na(SalePrice)) %>%
+      ggplot(aes(x=var1)) + geom_density(fill="blue")  + labs(title = "Train", x = var)
+    #test
+    num.test <- data %>% filter(is.na(SalePrice)) %>%
+      ggplot(aes(x=var2)) + geom_density(fill="blue")  + labs(title = "Test", x = var)
+    
+    return(grid.arrange(num.train, num.test))
+  }
+
+}
+
+
+
+#Conversion ordinal to continuous
+#giving a continuous value in each factor levels
+ordTonum <- function(var,set){
+  var <- as.character(var)
+  var <- revalue(var,set)
+  return(as.numeric(var))
+}
+
+```
+
+
+LotFrontage NA values
+-------------------
+```{r LotFrontageNA}
+#LotFrontage: Linear feet of street connected to property
+dat$LotFrontage %>% summary
+
+dat %>% filter(!is.na(SalePrice)) %>% select(LotFrontage) %>% summary
+dat %>% filter(is.na(SalePrice)) %>% select(LotFrontage) %>% summary
+
+train.test.graph("LotFrontage", dat %>% filter(!is.na(LotFrontage)))
+
+#The graphs shows LotFrontage has different shape of distribution in train and test set
+
+
+#Let's find the most important variable with LotFrontage
+relationship.test.num("LotFrontage", dat %>% 
+                        filter(!is.na(SalePrice) & !is.na(LotFrontage)) %>%
+                        subset(select = -c(YearBuilt, YearRemodAdd, GarageYrBlt,
+                                           Utilities, MoSold, YrSold)) %>% 
+                        mutate_if(is.character, as.factor))
+
+#MSSubclass is the most important one with Lotfrontage
+#Neighborhood and BldgType have high variable importance as well
+
+lotfront <- dat %>% filter(!is.na(LotFrontage)) %>%
+  mutate_if(is.character, as.factor)
+
+lotfront %>%
+  ggplot(aes(x=MSSubClass, y=LotFrontage, fill=MSSubClass)) +
+  geom_boxplot()
+
+
+lotfront %>%
+  group_by(MSSubClass) %>%
+  summarise(count = n(),
+            mean = mean(LotFrontage),
+            median = median(LotFrontage),
+            min = min(LotFrontage),
+            max = max(LotFrontage))
+
+
+lot.d1 <- data.frame(dat %>% filter(!is.na(LotFrontage)) %>% group_by(MSSubClass) %>% tally())
+
+lot.d2 <- data.frame(dat %>% filter(is.na(LotFrontage)) %>% group_by(MSSubClass) %>% tally())
+
+lot.d1$MSSubClass %in% lot.d2$MSSubClass
+
+m1 <- data.frame(merge(lot.d1, lot.d2, by="MSSubClass", all=TRUE))
+m1
+
+
+#LotArea..
+dat %>% filter(!is.na(LotFrontage)) %>% 
+  ggplot(aes(x=LotFrontage, y=log(LotArea+1))) + geom_jitter()
+
+#quick randomforest
+
+rf.lot <- randomForest(LotFrontage ~.,
+             data = dat %>% 
+               filter(complete.cases(.)) %>% 
+               mutate_if(is.character, as.factor))
+rf.lot
+importance(rf.lot) #LotArea , MSSubClass, Neighborhood, BldgType
+
+
+#creating new train set only for predicting lotfrontage 
+lot.dat <- dat %>% 
+  filter(!is.na(LotFrontage)) %>%
+  mutate_if(is.character, as.factor) %>%
+  select(LotFrontage, LotArea, MSSubClass, Neighborhood)
+  
+#test set
+lot.dat1 <- dat %>% 
+  filter(is.na(LotFrontage)) %>%
+  mutate_if(is.character, as.factor) %>%
+  select(LotFrontage, LotArea, MSSubClass, Neighborhood)
+
+lot.dat1$Neighborhood %>% levels()
+
+levels(lot.dat$Neighborhood) %in% levels(lot.dat1$Neighborhood)
+
+#some levels of Neighborhood are not in the test set
+
+lot.dat <- lot.dat[lot.dat$Neighborhood %in% levels(lot.dat1$Neighborhood),] 
+
+lot.dat$Neighborhood <- as.factor(as.character(lot.dat$Neighborhood))
+
+#random forest with LotArea, MSSubClass, and Neighborhood
+rf.lot <- randomForest(LotFrontage ~ LotArea+MSSubClass+Neighborhood,
+             data = lot.dat)
+
+rf.lot
+
+lot.dat %>% str
+lot.dat1 %>% str
+rf.pred <- predict(rf.lot, lot.dat1)
+
+
+#replace NA values in LotFrontage with predicted values from random forest
+dat$LotFrontage[is.na(dat$LotFrontage)] <- rf.pred
+
+
+
+summary(dat$LotFrontage)
+#no NA value
+cor(log(dat$SalePrice[!is.na(dat$SalePrice)]), log(dat$LotArea[!is.na(dat$SalePrice)]))
+cor(log(dat$SalePrice[!is.na(dat$SalePrice)]), log(dat$LotFrontage[!is.na(dat$SalePrice)]))
+
+train.test.graph("LotFrontage", dat %>% filter(!is.na(LotFrontage)))
+
+
+```
+
+
+
+Garage Factor variables NA values
+-----------------
+```{r GarageNAFac}
+
+dat %>% select(contains("Garage")) %>% mutate_if(is.character, as.factor) %>% summary
+
+#Factor: GarageType / GarageYrBlt / GarageFinish / GarageQual / GarageCond
+#Numeric: GarageCars / GarageArea
+
+#number of NA values are different 
+#Let's first fill the NA values of the factor Garage variable that has the least NA values, which is Garage Type
+
+garage.fac.var <- dat %>% 
+  select(contains("Garage")) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  select_if(is.factor) %>% 
+  colnames
+
+dat %>% select(contains("Garage")) %>% filter(is.na(GarageArea)) %>% head
+dat %>% select(contains("Garage")) %>% filter(is.na(GarageCars)) %>% head
+
+dat %>% select(contains("Garage")) %>% filter(!is.na(GarageType) & is.na(GarageQual)) %>% head
+dat %>% select(contains("Garage")) %>% filter(!is.na(GarageType) & is.na(GarageCond)) %>% head
+#GarageType : Detchd = Detached from home (might be street parking)
+
+dat$GarageType[is.na(dat$GarageType)]
+
+dat$GarageType[is.na(dat$GarageType)] <- "no garage"
+
+dat %>% 
+  select(contains("Garage")) %>% 
+  filter(GarageType == "Detchd" & !is.na(GarageQual)) %>% 
+  mutate_if(is.character, as.factor) %>%
+  summary
+
+dat %>% 
+  select(contains("Garage")) %>% 
+  filter(GarageType == "Detchd" & is.na(GarageQual)) %>% 
+  mutate_if(is.character, as.factor) %>%
+  summary
+
+#GarageYrBlt in GarageType "Detchd"
+dat$GarageYrBlt[is.na(dat$GarageYrBlt) & dat$GarageType == "Detchd"] <- median(dat$GarageYrBlt[dat$GarageType == "Detchd"], na.rm=TRUE)
+
+#GarageFinish = Unf
+dat$GarageFinish[is.na(dat$GarageFinish) & dat$GarageType == "Detchd"] <- "Unf"
+
+#GarageQual and GarageCond = TA
+dat$GarageQual[is.na(dat$GarageQual) & dat$GarageType == "Detchd"] <- "TA"
+dat$GarageCond[is.na(dat$GarageCond) & dat$GarageType == "Detchd"] <- "TA"
+
+dat %>% 
+  select(contains("Garage")) %>% 
+  filter(GarageType == "Detchd" & is.na(GarageCars)) %>% 
+  mutate_if(is.character, as.factor) %>%
+  summary
+
+dat %>% 
+  select(contains("Garage")) %>% 
+  filter(GarageType == "Detchd" & !is.na(GarageCars)) %>% 
+  mutate_if(is.character, as.factor) %>%
+  summary
+
+#GarageCars and GarageArea in GarageType Detchd = median value
+dat$GarageCars[is.na(dat$GarageCars) & dat$GarageType == "Detchd"] <- median(dat$GarageCars[dat$GarageType == "Detchd"], na.rm=TRUE)
+dat$GarageArea[is.na(dat$GarageArea) & dat$GarageType == "Detchd"] <- median(dat$GarageArea[dat$GarageType == "Detchd"], na.rm=TRUE)
+
+
+#Fill in Other NA values 
+dat$GarageYrBlt[is.na(dat$GarageYrBlt)] <- 0 #"no garage"
+dat$GarageFinish[is.na(dat$GarageFinish)] <- "no garage"
+dat$GarageQual[is.na(dat$GarageQual)] <- "no garage"
+dat$GarageCond[is.na(dat$GarageCond)] <- "no garage"
+
+
+dat %>% select(contains("Garage")) %>% mutate_if(is.character, as.factor) %>% summary
+#no NA value for Garage vars
+```
+
+
+
+Basement variables - factor variables
+-----------------
+```{r BsmtNAFactor}
+dat %>% select(contains("Bsmt")) %>%  
+  mutate_if(is.character, as.factor) %>% 
+  select_if(is.factor) %>% 
+  summary
+
+#BsmtFinType1 has the least number of NA values, so replace NA to no basement for BsmtFinType1 first
+
+dat$BsmtFinType1[is.na(dat$BsmtFinType1)] <- "no basement"
+
+
+#BsmtFinType2
+dat %>% select(contains("Bsmt")) %>% filter(is.na(BsmtFinType2) & BsmtFinType1 != "no basement")
+#BstmQual = Gd
+#BsmtCond = TA
+#BsmtFinType1 = GLQ
+
+dat %>% 
+  select(contains("Bsmt")) %>% 
+  filter(BsmtQual == "Gd" & BsmtCond == "TA" & BsmtFinType1 == "GLQ") %>% 
+  group_by(BsmtFinType2) %>% 
+  summarise(count = n(),
+            mean = mean(BsmtFinSF2))
+
+dat %>%
+  select(contains("Bsmt")) %>% 
+  filter(BsmtQual == "Gd" & BsmtCond == "TA" & BsmtFinType1 == "GLQ" & is.na(BsmtFinType2))
+
+#ALQ is the closest to the group mean of the BsmtFinSF2 for BsmtFinType2
+
+for(i in 1:nrow(dat)){
+  if(is.na(dat$BsmtFinType2[i])){
+    if(dat$BsmtFinType1[i] == "no basement"){
+      dat$BsmtFinType2[i] <- "no basement"
+    }
+    if(dat$BsmtFinType1[i] != "no basement"){
+      dat$BsmtFinType2[i] <- "ALQ"
+    }
+  }
+}
+
+dat %>% select(contains("Bsmt")) %>% 
+  filter(is.na(BsmtQual) & BsmtFinType1 == "no basement") %>% 
+  head
+
+#BestQual
+for(i in 1:nrow(dat)){
+  if(is.na(dat$BsmtQual[i])){
+    if(dat$BsmtFinType1[i] == "no basement"){
+      dat$BsmtQual[i] <- "no basement"
+    }
+    if(!is.na(dat$BsmtCond[i])){
+      dat$BsmtQual[i] <- dat$BsmtCond[i]
+    }
+  }
+}
+
+
+#BestCond 
+
+dat %>% select(contains("Bsmt")) %>% 
+  filter(is.na(BsmtCond)) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  summary
+
+
+for(i in 1:nrow(dat)){
+  
+  if(is.na(dat$BsmtCond[i])){
+    
+    if(dat$BsmtQual[i] == "no basement"){
+      dat$BsmtCond[i] <- "no basement"
+    }
+    if(dat$BsmtQual[i] != "no basement"){
+      dat$BsmtCond[i] <- dat$BsmtQual[i]
+    }
+    
+  }
+}
+
+summary(as.factor(dat$BsmtCond))
+summary(as.factor(dat$BsmtQual))
+
+
+
+#BsmtExposure
+dat %>% select(contains("Bsmt")) %>% 
+  filter(is.na(BsmtExposure)) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  summary
+
+dat %>% select(contains("Bsmt")) %>% 
+  filter(BsmtQual == "Gd") %>% 
+  group_by(BsmtExposure) %>% 
+  tally()
+
+for(i in 1:nrow(dat)){
+  if(is.na(dat$BsmtExposure[i])){
+    
+    if(dat$BsmtQual[i] == "no basement"){
+      dat$BsmtExposure[i] <- "no basement"
+    }
+    if(dat$BsmtQual[i] != "no basement"){
+      dat$BsmtExposure[i] <- "No"
+    }
+  }
+}
+
+
+
+dat %>% select(starts_with("Bsmt")) %>% 
+  select_if(is.character) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  summary
+#No Na values
+
+```
+
+
+Basement variables - numeric variables
+--------------
+```{r BsmtNANum}
+
+dat %>% select(contains("Bsmt")) %>%
+  select_if(is.numeric) %>% summary
+
+dat %>% select(contains("Bsmt")) %>% filter(is.na(BsmtFinSF1))
+dat %>% select(contains("Bsmt")) %>% filter(is.na(BsmtFullBath))
+
+
+#It's all no basement
+dat$BsmtFinSF1[is.na(dat$BsmtFinSF1)] <- 0
+dat$BsmtFinSF2[is.na(dat$BsmtFinSF2)] <- 0
+dat$BsmtUnfSF[is.na(dat$BsmtUnfSF)] <- 0
+dat$BsmtFullBath[is.na(dat$BsmtFullBath)] <- 0
+dat$BsmtHalfBath[is.na(dat$BsmtHalfBath)] <- 0
+
+
+dat %>% select(contains("Bsmt")) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  summary
+
+
+
+
+
+dat <- dat %>% mutate_if(is.character, as.factor)
+
+```
+
+MasVnrType NA values
+-------------------
+```{r MasVnrTypeNA}
+summary(as.factor(dat$MasVnrType))
+
+dat %>% select(contains("MasVnr")) %>% summary
+
+dat %>% select(contains("MasVnr")) %>% 
+  mutate_if(is.character, as.factor) %>%
+  group_by(MasVnrType) %>% 
+  summarise(count = n(),
+            mean = mean(MasVnrArea, na.rm=TRUE),
+            median =median(MasVnrArea, na.rm=TRUE))
+
+dat %>% select(starts_with("MasVnr")) %>%
+  mutate_if(is.character, as.factor) %>%
+  filter(is.na(MasVnrType))
+#There's NA values and one observation has MasVnrArea value, 198
+#and its mean value is close to the group mean of BrkCmn
+
+
+#Fill MasVnrArea NA values first
+dat$MasVnrArea[is.na(dat$MasVnrArea)] <- 0
+
+dat %>% select(contains("MasVnr")) %>% 
+  mutate_if(is.character, as.factor) %>%
+  filter(is.na(MasVnrType) & MasVnrArea !=0)
+
+for(i in 1:nrow(dat)){
+  if(is.na(dat$MasVnrType[i])){
+    
+    if(dat$MasVnrArea[i] == 0){
+      dat$MasVnrType[i] <- "None"
+    }
+    if(dat$MasVnrArea[i] != 0){
+      dat$MasVnrType[i] <- "BrkCmn"
+    }
+    
+  }
+}
+
+dat %>% select(contains("MasVnr")) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  summary
+
+#No NA Values
+
+```
+
+MSZoning NA values
+------------------
+```{r MSZoningNa}
+summary(as.factor(dat$MSZoning))
+#MSZoning: Identifies the general zoning classification of the sale.
+
+dat %>% filter(is.na(MSZoning))
+dat %>% 
+  group_by(MSZoning) %>%
+  summarise(count = n(),
+            mean = mean(SalePrice, na.rm=TRUE),
+            median = median(SalePrice, na.rm = TRUE),
+            sd = sd(SalePrice, na.rm = TRUE))
+
+
+#4 NA values, but they are in test set
+
+#Investigating MSzoning by MSSubClass 
+dat %>% filter(MSSubClass %in% c(30, 20, 70)) %>%
+  group_by(MSSubClass, MSZoning) %>%
+  summarise(count = n(),
+            mean = mean(SalePrice, na.rm=TRUE),
+            median = median(SalePrice, na.rm = TRUE),
+            sd = sd(SalePrice, na.rm = TRUE))
+
+#NA values will be replaced by the group mean
+#NA values in MSSubClass 20 will be replaced as RL
+#NA values in MSSubClass 30 will be replaced as RM
+#NA values in MSSubClass 70 will be replaced as RM
+
+
+dat$MSZoning[is.na(dat$MSZoning) & dat$MSSubClass == 20] <- "RL"
+dat$MSZoning[is.na(dat$MSZoning) & dat$MSSubClass == 30] <- "RM"
+dat$MSZoning[is.na(dat$MSZoning) & dat$MSSubClass == 70] <- "RM"
+
+
+
+summary(as.factor(dat$MSZoning))
+
+```
+
+Other NA values
+-----------
+```{r OtherNA}
+NAtable1 <- data.frame(dat %>% summarise_all(funs(sum(is.na(.)))))
+
+NAtable1 <- NAtable1[,which(NAtable1>0)]
+NAtable1 <- NAtable1 %>% subset(select = -c(SalePrice))
+dim(NAtable1)
+
+NAtable1 <- NAtable1[order(NAtable1, decreasing=TRUE)]
+
+NAtable1
+
+#Utilities
+summary(as.factor(dat$Utilities))
+dat$Utilities[is.na(dat$Utilities)] <- "AllPub"
+
+#Functional
+summary(as.factor(dat$Functional))
+dat$Functional[is.na(dat$Functional)] <- "Typ"
+
+#Exterior1st and Exterior2nd
+summary(as.factor(dat$Exterior1st))
+summary(as.factor(dat$Exterior2nd))
+
+dat %>% filter(is.na(Exterior1st))
+
+dat$Exterior1st[is.na(dat$Exterior1st)] <- "VinylSd"
+dat$Exterior2nd[is.na(dat$Exterior2nd)] <- "VinylSd"
+
+#TotalBsmtSF
+summary(dat$TotalBsmtSF)
+
+dat %>% filter(is.na(TotalBsmtSF))
+#no basement
+
+dat %>% filter(!is.na(TotalBsmtSF)) %>% 
+  group_by(BsmtCond) %>% 
+  summarise(count = n(),
+            median = median(TotalBsmtSF, na.rm=TRUE))
+#no basement -> 0
+
+dat$TotalBsmtSF[is.na(dat$TotalBsmtSF)] <- 0
+
+
+
+#Electrical
+summary(as.factor(dat$Electrical))
+
+dat$Electrical[is.na(dat$Electrical)] <- "SBrkr"
+
+
+#KitchenQual
+summary(as.factor(dat$KitchenQual))
+
+dat %>% filter(is.na(KitchenQual))
+
+dat$KitchenQual[dat$RoofStyle == "Gable" & dat$HouseStyle == "1.5Fin"] %>% table
+
+dat$KitchenQual[is.na(dat$KitchenQual)] <- "TA"
+
+
+#SaleType
+dat %>% filter(is.na(SaleType))
+
+summary(as.factor(dat$SaleType))
+
+dat$SaleType[is.na(dat$SaleType)] <- "WD"
+
+
+
+dat %>% filter(!is.na(SalePrice)) %>% filter(!complete.cases(.),)
+
+#We don't have any NA values now
+
+dat <- dat %>% mutate_if(is.integer, as.numeric)
+dat <- dat %>% mutate_if(is.character, as.factor)
+```
+
+Examine Factor Predictors
+-----------------
+```{r ExamFac}
+#factor first
+dat %>% select_if(is.factor) %>% summary
+
+
+
+#Factor Variables mostly skewed as the table shows
+
+fac.vars <- dat %>% select_if(is.factor) %>% colnames
+
+
+not.imp.fac <- NULL
+for(i in fac.vars){
+  if(any(prop.table(matrix(table(dat[,i]))) > 0.95)){
+    not.imp.fac <- c(not.imp.fac, i)
+  }
+}
+
+#These variables will have a factor level with 95% proportion in the variables
+not.imp.fac
+
+prop.func("Street") 
+table(dat$Street) #Pave has greater than 99% proportion in the Street
+prop.func("Alley") #Alley skewed
+prop.func("Utilities")
+
+```
+
+Examine Variables
+-----------------
+```{r ExamFac2}
+
+#Two skewed factor variables 
+chisq.test(dat$Street, dat$Alley, simulate.p.value = TRUE)
+#Chisq Test : we reject the null.. = both dependent 
+#It's obvious result since both variables have too many observations for one factor level
+
+
+summary(aov(lm(SalePrice ~ Street, data = dat %>% filter(!is.na(SalePrice)))))
+#Anova test shows p value more than 0.05, 
+#which means that all group means are almost equal
+
+t.test(SalePrice~Street, data = dat %>% filter(!is.na(SalePrice)))
+#P value higher than 0.05
+#We are not confident that the difference 
+#between group means will fall in the confidence interval containing 0
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=Street, y=SalePrice)) + geom_boxplot()
+
+
+#But it won't tell you whether we have to choose these factor variables as predictors or not.
+#However, we still can see the relationship between factor predictors 
+
+#creating variables names
+variables <- dat %>% 
+  subset(select= -c(YearBuilt, YearRemodAdd, GarageYrBlt, YrSold, MoSold)) %>% 
+  colnames
+
+#dummy data
+test.data <- data.frame(cols = variables)
+
+data.pval <- relationship.test(variables, test.data, 
+                               dat %>% 
+                                 filter(!is.na(SalePrice)) %>% 
+                                 subset(select= -c(YearBuilt, YearRemodAdd, GarageYrBlt, YrSold, MoSold)))
+
+
+data.pval %>% select(cols,SalePrice, not.imp.fac) %>% head
+#factor vs factor : if <0.05 (p value), independent, if not, dependent
+#factor vs numeric : if <0.05, at least one factor has different mean than others (dependent). 
+#if not, all factor has similar mean (non linear, independent)
+#numeric vs numeric : if <0.5, low correlation, if not, high correlation
+
+#we notice that those variables are highly dependent to other variables 
+
+
+
+#Let's examine all predictors deeply
+```
+
+BldgType
+----------------
+```{r BldgType.HouseStyle}
+
+dat %>% filter(!is.na(SalePrice)) %>% 
+  ggplot(aes(x=BldgType, y=SalePrice, fill=BldgType))+
+  geom_boxplot()
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(BldgType) %>% summarise(count = n(),
+                                   mean = mean(SalePrice),
+                                   median = median(SalePrice))
+
+table(dat$BldgType)
+
+train.test.graph("BldgType", dat)
+
+#creating new BldgType variable by the group mean of SalePrice
+dat$BldgType.new <- NA
+
+dat$BldgType.new[which(dat$BldgType %in% c("2fmCon", "Duplex", "Twnhs"))] <- "low bldg"
+dat$BldgType.new[which(dat$BldgType %in% c("1Fam", "TwnhsE"))] <- "high bldg"
+
+table(dat$BldgType.new)
+
+dat %>% filter(!is.na(SalePrice)) %>% 
+  ggplot(aes(x=BldgType.new, y=SalePrice, fill=BldgType.new))+
+  geom_boxplot()
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(BldgType.new) %>% summarise(count = n(),
+                                   mean = mean(SalePrice),
+                                   median = median(SalePrice))
+
+
+train.test.graph("BldgType.new", dat)
+
+#HouseStyle
+
+dat %>% filter(!is.na(SalePrice)) %>% 
+  ggplot(aes(x=HouseStyle, y=SalePrice, fill=HouseStyle))+
+  geom_boxplot()
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(HouseStyle) %>% summarise(count = n(),
+                                   mean = mean(SalePrice),
+                                   median = median(SalePrice)) %>% arrange(desc(mean))
+
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(HouseStyle) %>% tally()
+
+
+dat %>% filter(is.na(SalePrice)) %>%
+  group_by(HouseStyle) %>% tally()
+
+
+train.test.graph("HouseStyle", dat)
+
+
+#Test set doesn't have 2.5Fin 
+#combine 2.5Fin -> 2STory, which have similar group mean
+
+#and creating new HouseStyle variable by group mean of saleprice
+
+dat$HouseStyle <- as.character(dat$HouseStyle)
+dat$HouseStyle[dat$HouseStyle == "2.5Fin"] <- "2Story"
+
+table(dat$HouseStyle)
+
+dat$HouseStyle.new <- NA
+
+dat$HouseStyle.new[which(dat$HouseStyle == "2Story")] <- "high house"
+dat$HouseStyle.new[which(dat$HouseStyle %in% c("1Story", "SLvl"))] <- "medium house" 
+dat$HouseStyle.new[which(dat$HouseStyle %in% c("2.5Unf", "1.5Fin", "SFoyer", "1.5Unf"))] <- "low house"
+
+table(dat$HouseStyle.new)
+
+
+
+dat %>% filter(!is.na(SalePrice)) %>% 
+  ggplot(aes(x=HouseStyle.new, y=SalePrice, fill=HouseStyle.new))+
+  geom_boxplot()
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(HouseStyle.new) %>% summarise(count = n(),
+                                   mean = mean(SalePrice),
+                                   median = median(SalePrice)) %>% arrange(desc(mean))
+
+
+
+
+train.test.graph("HouseStyle.new", dat)
+
+#removing original BldgType and HouseStyle
+dat <- dat %>% subset(select = -c(BldgType,HouseStyle))
+
+```
+
+Roof
+---------
+```{r Roof}
+dat %>% group_by(RoofStyle, RoofMatl) %>% tally()
+
+dat %>% filter(!is.na(SalePrice)) %>% 
+  ggplot(aes(x=RoofStyle, y=SalePrice, fill=RoofStyle)) +
+  geom_boxplot()+
+  theme(axis.text.x = element_text(angle=90))
+
+dat %>% filter(!is.na(SalePrice)) %>% 
+  ggplot(aes(x=RoofStyle, y=SalePrice, fill=RoofStyle)) +
+  geom_bar(stat="summary", fun.y="mean")
+
+dat %>% filter(!is.na(SalePrice)) %>% 
+  group_by(RoofStyle) %>% 
+  summarise(count = n(),
+            mean = mean(SalePrice),
+            median = median(SalePrice),
+            sd= sd(SalePrice))
+
+dat %>% filter(is.na(SalePrice)) %>% group_by(RoofStyle) %>% tally()
+dat %>% filter(!is.na(SalePrice)) %>% group_by(RoofStyle) %>% tally()
+
+train.test.graph("RoofStyle", dat)
+
+#RoofStyle may not be a good predictor, let's keep this anyway
+
+
+#RoofMatl
+dat %>% filter(!is.na(SalePrice)) %>% 
+  ggplot(aes(x=RoofMatl, y=SalePrice, fill=RoofMatl)) +
+  geom_boxplot()+
+  theme(axis.text.x = element_text(angle=90))
+
+dat %>% filter(!is.na(SalePrice)) %>% 
+  group_by(RoofMatl) %>% 
+  summarise(count = n(),
+            mean = mean(SalePrice),
+            median = median(SalePrice),
+            min = min(SalePrice),
+            max = max(SalePrice))
+
+dat %>% filter(is.na(SalePrice)) %>% group_by(RoofMatl) %>% tally()
+dat %>% filter(!is.na(SalePrice)) %>% group_by(RoofMatl) %>% tally()
+
+train.test.graph("RoofMatl", dat)
+#notice test set doesn't have ClyTile / Membran / Metal / Roll
+
+#ClyTile -> CompShg
+#Membran -> WdShake
+#Metal -> CompShg
+#Roll -> CompShg
+
+dat$RoofMatl <- as.character(dat$RoofMatl)
+dat$RoofMatl[dat$RoofMatl %in% c("ClyTile", "Metal", "Roll")] <- "CompShg"
+dat$RoofMatl[dat$RoofMatl=="Membran"] <- "WdShake"
+
+
+table(dat$RoofMatl)
+
+train.test.graph("RoofMatl", dat)
+
+dat %>% select(contains("Roof")) %>% mutate_if(is.character, as.factor) %>% summary
+
+```
+
+
+Exterior..
+----------------
+```{r Exterior}
+
+dat %>% select(contains("Exter")) %>% summary
+
+#Exterior1st and Exterior2nd 
+table(dat$Exterior1st, dat$Exterior2nd)
+
+table(dat$Exterior1st)
+table(dat$Exterior2nd)
+
+#Exterior 1st visualization 
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=Exterior1st, y=SalePrice, fill=Exterior1st)) +
+  geom_boxplot()+
+  theme(axis.text.x = element_text(angle=90))
+
+#Exterior 2nd visualization
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=Exterior2nd, y=SalePrice, fill=Exterior2nd)) +
+  geom_boxplot()+
+  theme(axis.text.x = element_text(angle=90))
+
+
+#combine exterior1st and exterior2nd
+dat$Exterior <- NA
+dat$Exterior1st <- as.character(dat$Exterior1st)
+dat$Exterior2nd <- as.character(dat$Exterior2nd)
+for(i in 1:nrow(dat)){
+  if(dat$Exterior1st[i] == dat$Exterior2nd[i]){
+    dat$Exterior[i] <- "same Exter"
+  }
+  if(dat$Exterior1st[i] != dat$Exterior2nd[i]){
+    dat$Exterior[i] <- "more option Exter"
+  }
+}
+
+table(dat$Exterior)
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=Exterior, y=SalePrice, fill=Exterior))+
+  geom_boxplot()
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(Exterior) %>% summarise(count = n(),
+                                   mean = mean(SalePrice),
+                                   median = median(SalePrice),
+                                   sd = sd(SalePrice))
+#group mean almost same 
+
+
+
+
+
+#Exterior 1st
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(Exterior1st) %>% summarise(count = n(),
+                                      mean = mean(SalePrice),
+                                      median = median(SalePrice),
+                                      sd = sd(SalePrice)) %>% arrange(median)
+
+dat %>% filter(is.na(SalePrice)) %>%
+  group_by(Exterior1st) %>% tally()
+
+dat$Exterior1st <- as.character(dat$Exterior1st)
+
+train.ext1.level <-  levels(as.factor(dat$Exterior1st[!is.na(dat$SalePrice)]))
+
+test.ext1.level <- levels(as.factor(dat$Exterior1st[is.na(dat$SalePrice)]))
+
+train.ext1.level[!train.ext1.level %in% test.ext1.level]
+
+#only training set has ImStucc and Stone
+
+dat$Exterior1st[dat$Exterior1st == "ImStucc" | dat$Exterior1st == "Stone"] <- "CemntBd"
+
+ext1 <- dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(Exterior1st) %>% summarise(count = n(),
+                                      mean = mean(SalePrice),
+                                      median = median(SalePrice),
+                                      sd = sd(SalePrice)) %>% arrange(median)
+ext1
+
+ext1$Exterior1st[ext1$median < 130000]
+dat$Exterior1st[dat$Exterior1st %in% ext1$Exterior1st[ext1$median < 130000]] <- "WdShing"
+dat$Exterior1st[dat$Exterior1st == "Stucco"] <- "HdBoard"
+
+train.test.graph("Exterior1st", dat)
+
+
+#Exterior 2nd
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(Exterior2nd) %>% summarise(count = n(),
+                                      mean = mean(SalePrice),
+                                      median = median(SalePrice),
+                                      sd = sd(SalePrice)) %>% arrange(median)
+
+dat %>% filter(is.na(SalePrice)) %>%
+  group_by(Exterior2nd) %>% tally()
+
+
+dat$Exterior2nd <- as.character(dat$Exterior2nd)
+
+train.ext2.level <-  levels(as.factor(dat$Exterior2nd[!is.na(dat$SalePrice)]))
+
+test.ext2.level <- levels(as.factor(dat$Exterior2nd[is.na(dat$SalePrice)]))
+
+train.ext2.level[!train.ext2.level %in% test.ext2.level]
+
+dat$Exterior2nd[dat$Exterior2nd == "Other"] <- "CmentBd"
+
+
+ext2 <- dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(Exterior2nd) %>% summarise(count = n(),
+                                      mean = mean(SalePrice),
+                                      median = median(SalePrice),
+                                      sd = sd(SalePrice)) %>% arrange(median)
+
+ext2
+
+dat$Exterior2nd[dat$Exterior2nd %in% ext2$Exterior2nd[ext2$median < 138000]] <- "Wd Sdng"
+dat$Exterior2nd[dat$Exterior2nd == "Wd Shng"] <- "MetalSd"
+dat$Exterior2nd[dat$Exterior2nd == "AsphShn"] <- "MetalSd"
+dat$Exterior2nd[dat$Exterior2nd %in% c("Stucco", "Brk Cmn")] <- "HdBoard"
+dat$Exterior2nd[dat$Exterior2nd %in% c("BrkFace", "Stone")] <- "Plywood"
+dat$Exterior2nd[dat$Exterior2nd == "ImStucc"] <- "VinylSd"
+
+train.test.graph("Exterior2nd", dat)
+
+
+#ExterCond
+table(dat$ExterCond)
+#ext.qual for converting the quality or condition as continuous variable
+
+ext.qual <- c("Ex" = 5, 
+              "Gd"= 4, 
+              "TA" = 3, 
+              "Fa" = 2, 
+              "Po" = 1)
+
+#ExterQual and ExterCond
+dat %>% group_by(ExterQual, ExterCond) %>% tally()
+
+prop.func("ExterQual")
+prop.func("ExterCond")
+table(dat$ExterQual)
+table(dat$ExterCond)
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=ExterQual, y=SalePrice, fill=ExterQual))+
+  geom_boxplot()
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=ExterCond, y=SalePrice, fill=ExterCond))+
+  geom_boxplot()
+
+
+#Exter Cond
+dat %>% filter(!is.na(SalePrice)) %>% group_by(ExterCond) %>% tally()#train set has 1 poor
+dat %>% filter(is.na(SalePrice)) %>% group_by(ExterCond) %>% tally()#train set has 2 poor
+
+train.test.graph("ExterCond", dat)
+
+dat$ExterCond <- ordTonum(dat$ExterCond, ext.qual)
+
+table(dat$ExterCond)
+
+#ExterQual
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=ExterQual, y=SalePrice, fill=ExterQual))+
+  geom_boxplot()
+
+dat %>% filter(!is.na(SalePrice)) %>% group_by(ExterQual) %>% 
+  summarise(count = n(),
+            mean = mean(SalePrice),
+            median = median(SalePrice),
+            sd = sd(SalePrice))
+
+dat %>% filter(is.na(SalePrice)) %>% group_by(ExterQual) %>% tally() 
+dat %>% filter(!is.na(SalePrice)) %>% group_by(ExterQual) %>% tally() 
+
+train.test.graph("ExterQual", dat)
+
+table(dat$ExterQual)
+
+dat$ExterQual <- ordTonum(dat$ExterQual, ext.qual)
+
+dat <- dat %>% mutate_if(is.character, as.factor)
+dat %>% select(contains("Ext")) %>% summary
+
+
+```
+
+Basement
+-----------
+```{r Bsmt}
+dat %>% select(contains("Bsmt")) %>% summary
+
+
+#bsmt.qual for converting basement quality and condition as continuous variable
+bsmt.qual <- c("Ex" = 5, 
+              "Gd"= 4, 
+              "TA" = 3, 
+              "Fa" = 2, 
+              "Po" = 1,
+              "no basement" = 0)
+
+
+bsmt.qual
+
+
+#BsmtQual
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=BsmtQual, y=SalePrice, fill=BsmtQual))+
+  geom_boxplot()
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(BsmtQual) %>%
+  summarise(count = n(),
+            mean = mean(SalePrice),
+            median = median(SalePrice),
+            sd = sd(SalePrice))
+
+dat %>% filter(is.na(SalePrice)) %>% group_by(BsmtQual) %>% tally()
+
+train.test.graph("BsmtQual", dat)
+
+
+dat$BsmtQual <- ordTonum(dat$BsmtQual, bsmt.qual)
+
+#BsmtCond
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=BsmtCond, y= SalePrice, fill=BsmtCond))+
+  geom_boxplot()
+
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(BsmtCond) %>%
+  summarise(count = n(),
+            mean = mean(SalePrice),
+            median = median(SalePrice),
+            sd = sd(SalePrice))
+
+dat %>% filter(!is.na(SalePrice)) %>% group_by(BsmtCond) %>% tally() #train has 2 Po
+dat %>% filter(is.na(SalePrice)) %>% group_by(BsmtCond) %>% tally() #test has 3 Po
+
+train.test.graph("BsmtCond", dat)
+
+
+dat$BsmtCond <- ordTonum(dat$BsmtCond, bsmt.qual)
+
+#BsmtFinSF1, BsmtFinSF2, BsmtUnfSF
+
+dat %>% select(BsmtFinSF1, BsmtFinSF2, BsmtUnfSF, TotalBsmtSF) %>% head
+
+cor((dat$BsmtFinSF1 + dat$BsmtFinSF2 + dat$BsmtUnfSF), dat$TotalBsmtSF)
+#correlation value is 1, which means that the sum of 3 bsmt SF value is the same with TotalBsmtSF
+
+train.test.graph("BsmtFinSF1", dat)
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=BsmtFinSF1, y=SalePrice)) + geom_jitter()
+
+train.test.graph("BsmtFinSF2", dat)
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=BsmtFinSF2, y=SalePrice)) + geom_jitter()
+
+train.test.graph("BsmtUnfSF", dat)
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=BsmtUnfSF, y=SalePrice)) + geom_jitter()
+
+train.test.graph("TotalBsmtSF", dat)
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=TotalBsmtSF, y=SalePrice)) + geom_jitter()
+
+which(dat$TotalBsmtSF>3000) #these 6 obs may be outliers
+
+
+#train have 5 outliers
+#we have one outlier in testset 
+
+dat %>% mutate_if(is.character, as.factor) %>% select(contains("Bsmt")) %>% summary
+
+#will see the Bsmt Bath with other Bath vars
+```
+
+
+Heating
+------------
+```{r Heating}
+
+dat %>% select(Heating, HeatingQC, CentralAir) %>% summary
+
+#Heating
+prop.func("Heating") #quite skewed
+
+dat %>% filter(!is.na(SalePrice)) %>% 
+  ggplot(aes(x=Heating, y=SalePrice, fill=Heating)) + geom_boxplot()
+
+dat %>% filter(!is.na(SalePrice)) %>% group_by(Heating) %>% tally()
+dat %>% filter(is.na(SalePrice)) %>% group_by(Heating) %>% tally()
+
+#combining Heating factors
+dat$isHeating <- ifelse(dat$Heating == "GasA", "GasA", "Other")
+table(dat$isHeating)
+prop.func("isHeating")
+
+train.test.graph("Heating", dat)
+train.test.graph("isHeating", dat)
+
+#testset doesn't have Floor / OthW
+#Floor / OthW -> GasA
+dat$Heating <- as.character(dat$Heating)
+dat$Heating[dat$Heating == "Floor"] <- "GasA"
+dat$Heating[dat$Heating == "OthW"] <- "GasA"
+
+train.test.graph("Heating", dat)
+
+table(dat$Heating)
+
+#HeatingQC
+prop.func("HeatingQC")
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=HeatingQC, y=SalePrice, fill=HeatingQC))+
+  geom_boxplot()
+
+dat %>% filter(!is.na(SalePrice)) %>% group_by(HeatingQC) %>% tally()
+dat %>% filter(is.na(SalePrice)) %>% group_by(HeatingQC) %>% tally()
+
+dat$HeatingQC[dat$HeatingQC == "Po"] <- "Fa"
+
+dat %>% 
+  filter(!is.na(SalePrice)) %>% 
+  group_by(HeatingQC) %>%
+  summarise(count = n(),
+            mean = mean(SalePrice),
+            median = median(SalePrice),
+            sd = sd(SalePrice))
+
+train.test.graph("HeatingQC", dat)
+
+table(dat$HeatingQC)
+
+#heat.qual for converting Heating Quality as a continuous variable
+heat.qual <- c("Ex" = 5, 
+          "Gd"= 4, 
+          "TA" = 3, 
+          "Fa" = 2, 
+          "Po" = 1)
+
+dat$HeatingQC <- ordTonum(dat$HeatingQC, heat.qual)
+
+
+#CentralAir
+
+prop.func("CentralAir")
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=CentralAir, y=SalePrice, fill=CentralAir))+
+  geom_boxplot()
+
+dat %>% filter(!is.na(SalePrice)) %>% group_by(CentralAir) %>% tally()
+dat %>% filter(is.na(SalePrice)) %>% group_by(CentralAir) %>% tally()
+
+
+train.test.graph("CentralAir", dat)
+
+
+```
+
+Garage
+----------
+```{r Garage}
+garage.var <- dat %>% select(contains("Garage")) %>% summary
+garage.var
+
+
+#Garage Year Built
+table(dat$GarageYrBlt)
+
+#GarageYrBlt = 2207
+
+dat %>% filter(GarageYrBlt == 2207) %>% head #it's in testset
+#replace this as max value of other year values
+
+dat %>% select(contains("Year"), contains("Yr")) %>% summary
+#2010!
+
+dat$GarageYrBlt[dat$GarageYrBlt == 2207] <- 2010
+
+
+dat %>% 
+  filter(!is.na(SalePrice) & GarageYrBlt != 0) %>% 
+  group_by(GarageYrBlt) %>% 
+  summarise(mean.grg = mean(SalePrice)) %>%
+  ggplot(aes(x=as.factor(GarageYrBlt), y=mean.grg, group=1))+
+  geom_line()+
+  theme(axis.text.x = element_text(angle=90))
+
+
+#GarageAge
+#YrSold - GarageYrBlt
+
+dat %>% mutate(GarageAge = YrSold - GarageYrBlt) %>% select(GarageAge) %>% summary
+
+#negative value of GarageAge
+
+dat %>% mutate(GarageAge = YrSold - GarageYrBlt) %>% filter(GarageAge < 0) %>% select(GarageAge, YrSold, GarageYrBlt, SalePrice) %>% head
+#These are in testset.. 
+#replace the GarageYrBlt -> same value of YrSold
+dat %>% mutate(GarageAge = YrSold - GarageYrBlt) %>% filter(GarageAge < 0) %>% mutate(GarageYrBlt = YrSold) %>% select(GarageAge, YrSold, GarageYrBlt, SalePrice) %>% head
+
+dat %>% mutate(GarageAge = YrSold - GarageYrBlt) %>% filter(GarageAge < 1000 & !is.na(SalePrice)) %>%
+  ggplot(aes(x=GarageAge, y=SalePrice)) + geom_jitter()
+
+
+#no garage values
+dat %>% mutate(GarageAge = YrSold - GarageYrBlt) %>% filter(GarageAge > 1000) %>% select(GarageAge, YrSold, GarageYrBlt, SalePrice) %>% head
+
+dat %>% filter(GarageYrBlt==0) %>% group_by(GarageYrBlt) %>% tally
+
+#no garage values -> GarageAge = sample(90:110, size = 1 , replace=TRUE)
+
+dat$GarageAge <- NA
+for(i in 1:nrow(dat)){
+  if(dat$GarageYrBlt[i] == 0){
+    dat$GarageAge[i] <- sample(90:110, 1)
+  }
+  if(dat$GarageYrBlt[i] > dat$YrSold[i]){
+    dat$GarageYrBlt[i] <- dat$YrSold[i]
+    
+    dat$GarageAge[i] <- dat$YrSold[i] - dat$GarageYrBlt[i]
+  }
+  if(dat$GarageYrBlt[i] <= dat$YrSold[i] & dat$GarageYrBlt[i] != 0){
+    dat$GarageAge[i] <- dat$YrSold[i] - dat$GarageYrBlt[i]
+  }
+}
+
+summary(dat$GarageAge)
+
+train.test.graph("GarageAge", dat)
+
+#GarageFinish
+
+dat %>% 
+  filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=GarageFinish, y=SalePrice, fill=GarageFinish))+
+  geom_boxplot()
+
+train.test.graph("GarageFinish",dat)
+
+#Grgfin.qual for converting GarageFinish as continuous variable
+grgfin.qual <- c("Fin" = 4, 
+          "RFn"= 3, 
+          "Unf" = 2, 
+          "no garage" = 1)
+
+dat$GarageFinish <- ordTonum(dat$GarageFinish, grgfin.qual)
+
+#GarageCars
+dat %>%
+  filter(!is.na(SalePrice)) %>% mutate(GarageCars = as.factor(GarageCars)) %>%
+  ggplot(aes(x=GarageCars, y=SalePrice, fill=GarageCars))+
+  geom_boxplot()
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(GarageCars) %>%
+  summarise(count = n(),
+            mean = mean(SalePrice),
+            median = median(SalePrice),
+            sd = sd(SalePrice))
+
+train.test.graph("GarageCars",dat)
+
+
+
+#GarageArea
+
+#log GarageArea
+dat %>% mutate(GarageArea = log(GarageArea + 1)) %>%
+  ggplot(aes(x=GarageArea, y=GarageCars)) + geom_jitter()
+
+
+dat %>%
+  filter(!is.na(SalePrice) & GarageType != "no garage") %>% 
+  ggplot(aes(x=GarageArea, y=SalePrice, color=GarageType))+
+  geom_jitter(alpha=0.5)+
+  ggtitle("GarageArea vs SalePrice by GarageType")
+  
+dat %>%
+  filter(!is.na(SalePrice) & GarageType != "no garage") %>% 
+  ggplot(aes(x=GarageArea, y=SalePrice, color=as.factor(GarageCars)))+
+  geom_jitter(alpha=0.5)+
+  labs(color = "GarageCars")+
+  ggtitle("GarageArea vs SalePrice by GarageCars")
+
+dat %>%
+  filter(!is.na(SalePrice) & GarageType != "no garage") %>% 
+  ggplot(aes(x=GarageArea, y=SalePrice, color=GarageFinish))+
+  geom_jitter(alpha=0.5)+
+  ggtitle("GarageArea vs SalePrice by GarageFinish")
+
+
+train.test.graph("GarageArea", dat)
+
+
+#GarageQual
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=GarageQual, y=SalePrice, fill=GarageQual))+
+  geom_boxplot()
+
+
+dat %>% filter(!is.na(SalePrice)) %>% group_by(GarageQual) %>% summarise(count = n(),
+                                                                         mean = mean(SalePrice),
+                                                                         median = median(SalePrice),
+                                                                         sd = sd(SalePrice))
+
+dat %>% filter(is.na(SalePrice)) %>% group_by(GarageQual) %>% tally()
+dat %>% filter(!is.na(SalePrice)) %>% group_by(GarageQual) %>% tally()
+
+
+train.test.graph("GarageQual", dat)
+
+table(dat$GarageQual)
+
+grg.qual <- c("Ex" = 5, 
+          "Gd"= 4, 
+          "TA" = 3, 
+          "Fa" = 2, 
+          "Po" = 1,
+          "no garage" = 0)
+
+table(ordTonum(dat$GarageQual, grg.qual))
+
+dat$GarageQual <- ordTonum(dat$GarageQual, grg.qual)
+
+#GarageCond
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=GarageCond, y=SalePrice, fill=GarageCond))+
+  geom_boxplot()
+
+
+dat %>% filter(!is.na(SalePrice)) %>% group_by(GarageCond) %>% summarise(count = n(),
+                                                                         mean = mean(SalePrice),
+                                                                         median = median(SalePrice),
+                                                                         sd = sd(SalePrice))
+
+dat %>% filter(is.na(SalePrice)) %>% group_by(GarageCond) %>% tally()
+dat %>% filter(!is.na(SalePrice)) %>% group_by(GarageCond) %>% tally()
+
+train.test.graph("GarageCond", dat)
+
+table(dat$GarageCond)
+
+dat$GarageCond <- ordTonum(dat$GarageCond, grg.qual)
+
+
+
+#Garage Type
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=GarageType, y=SalePrice, fill=GarageType))+
+  geom_boxplot()
+
+
+dat %>% filter(!is.na(SalePrice)) %>% group_by(GarageType) %>% tally()
+dat %>% filter(is.na(SalePrice)) %>% group_by(GarageType) %>% tally()
+
+dat %>% filter(!is.na(SalePrice)) %>% group_by(GarageType) %>% summarise(count = n(),
+                                                                         mean = mean(SalePrice),
+                                                                         median = median(SalePrice),
+                                                                         sd = sd(SalePrice))
+
+#Builtin <- high
+#Attchd <- medium 1
+#2Types + Basment <- medium 2
+#carport + detchd <- low
+#no garage <- no
+
+dat$GarageType.new <- NA
+dat$GarageType.new[dat$GarageType == "BuiltIn"] <- 3
+dat$GarageType.new[dat$GarageType %in% c("2Types", "Basment", "Attchd")] <-2
+dat$GarageType.new[dat$GarageType %in% c("CarPort", "Detchd")] <- 1
+dat$GarageType.new[dat$GarageType == "no garage"] <- 0
+
+table(dat$GarageType.new)
+
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=GarageType.new, y=SalePrice))+
+  geom_jitter()
+
+train.test.graph("GarageType.new", dat)
+
+
+
+
+dat %>% select(contains("garage")) %>% summary
+#remove GarageYrBlt
+dat <- dat %>% subset(select = -c(GarageYrBlt))
+
+```
+
+
+Pool
+--------
+```{r Pool}
+dat %>% select(contains("Pool")) %>% colnames
+
+table(dat$PoolQC)
+
+pool.qual <- c("Ex" = 5, 
+          "Gd"= 4, 
+          "TA" = 3, 
+          "Fa" = 2, 
+          "Po" = 1,
+          "no pool" = 0)
+
+dat$PoolQC <- ordTonum(dat$PoolQC, pool.qual)
+
+summary(dat$PoolArea)
+
+dat %>% filter(PoolArea > 0) %>% group_by(PoolArea) %>% tally()
+#only 13 obs recorded
+
+dat %>% filter(!is.na(SalePrice) & PoolArea != 0) %>%
+  ggplot(aes(x=PoolArea, y=SalePrice)) + geom_jitter()
+
+
+```
+
+Miscellaneous..
+-------------
+```{r Misc}
+dat %>% select(contains("Misc")) %>% colnames
+
+#MiscFeature
+table(dat$MiscFeature)
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=MiscFeature, y=SalePrice, fill=MiscFeature))+
+  geom_boxplot()
+
+dat$noMiscFeature <- ifelse(dat$MiscFeature == "None", "None", "Misc")
+table(dat$noMiscFeature)
+
+
+table(dat$MiscVal)
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=MiscVal, y=SalePrice))+
+  geom_jitter()
+
+train.test.graph("MiscFeature",dat)
+train.test.graph("MiscVal",dat)
+
+
+```
+
+Porch
+-----------
+```{r Porch}
+dat %>% select(contains("Porch")) %>% summary
+
+#OpenPorchSF
+dat %>% 
+  filter(!is.na(SalePrice)) %>% 
+  mutate(OpenPorchSF = OpenPorchSF, SalePrice = SalePrice) %>%
+  ggplot(aes(x=OpenPorchSF, y=SalePrice))+
+  geom_jitter()
+
+train.test.graph("OpenPorchSF", dat)
+
+
+#EnclosedPorch
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=EnclosedPorch, y=SalePrice))+
+  geom_jitter()
+
+train.test.graph("EnclosedPorch", dat)
+
+#X3SsnPorch
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=X3SsnPorch, y=SalePrice))+
+  geom_jitter()
+
+train.test.graph("X3SsnPorch", dat)
+
+#SCreenPorch
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=ScreenPorch, y=SalePrice))+
+  geom_jitter()
+
+train.test.graph("ScreenPorch", dat)
+
+#combine all 4
+
+dat %>% mutate(Porch = (OpenPorchSF + EnclosedPorch + X3SsnPorch + ScreenPorch)) %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=log(Porch+1), y=log(SalePrice+1)))+
+  geom_jitter()
+
+
+dat <- dat %>% mutate(Porch = (OpenPorchSF + EnclosedPorch + X3SsnPorch + ScreenPorch))
+
+dat$Porch %>% summary
+
+train.test.graph("Porch", dat)
+
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=Porch, y=SalePrice)) + geom_jitter()
+
+dat %>% select(contains("porch")) %>% colnames
+
+porch <- dat %>% filter(!is.na(SalePrice)) %>% select_if(is.numeric) %>% select(contains("porch"), SalePrice)
+
+cor(porch)
+
+
+
+dat$isPorch <- ifelse(dat$Porch != 0, "Porch", "no Porch")
+table(dat$isPorch)
+
+dat %>% filter(!is.na(SalePrice)) %>% 
+  ggplot(aes(x=isPorch, y=SalePrice)) + geom_boxplot()
+
+train.test.graph("isPorch", dat)
+
+
+```
+
+
+Year or Month..
+------------------
+```{r Year}
+dat %>% select(contains("Year")) %>% colnames
+dat %>% select(contains("Yr")) %>% colnames
+dat %>% select(contains("Mo")) %>% colnames
+
+#YearBuilt / YearRemodAdd / GarageYear / YrSold / MoSold
+
+#YearBuilt / YearRemodAdd / GarageYear / YrSold / MoSold
+
+#YearBuilt 
+
+table(dat$YearBuilt)
+
+dat %>% select(contains("Year"),contains("Yr")) %>% summary
+
+#more see for Yearbuilt and YearRemodadd
+
+dat %>% select(contains("Year")) %>% head
+
+which(dat$YearBuilt == dat$YearRemodAdd) %>% head
+
+
+#I will create two variables from here
+
+#Age : 2010 - YearRemodAdd
+dat$Age <- dat$YrSold - dat$YearRemodAdd
+
+dat %>% filter(Age < 0)
+
+#These might be the houses that householder bought this before the remodeling completed. 
+#adding 2 for all obs
+dat$Age <- dat$Age + 2
+
+train.test.graph("Age", dat)
+
+
+
+#YearBuilt 
+
+summary(dat$YearBuilt)
+
+dat %>% 
+  filter(!is.na(SalePrice)) %>% 
+  group_by(YearBuilt) %>% 
+  summarise(mean.grg = mean(SalePrice)) %>%
+  ggplot(aes(x=as.factor(YearBuilt), y=mean.grg, group=1))+
+  geom_line()+
+  theme(axis.text.x = element_text(angle=90))
+
+dat$YearBuilt.deca <- NA
+for(i in 1:nrow(dat)){
+  dat$YearBuilt.deca[i] <- floor_decade(dat$YearBuilt[i])
+}
+
+
+summary(dat$YearBuilt.deca)
+
+dat %>% 
+  filter(!is.na(SalePrice)) %>% 
+  group_by(YearBuilt.deca) %>% 
+  summarise(mean.grg = mean(SalePrice)) %>%
+  ggplot(aes(x=as.factor(YearBuilt.deca), y=mean.grg, group=1))+
+  geom_line()+
+  theme(axis.text.x = element_text(angle=90))
+
+
+
+
+#YearremodAdd
+
+summary(dat$YearRemodAdd)
+
+dat %>% 
+  filter(!is.na(SalePrice)) %>% 
+  group_by(YearRemodAdd) %>% 
+  summarise(mean.grg = mean(SalePrice)) %>%
+  ggplot(aes(x=as.factor(YearRemodAdd), y=mean.grg, group=1))+
+  geom_line()+
+  theme(axis.text.x = element_text(angle=90))
+
+dat$YearRemodAdd.deca <- NA
+for(i in 1:nrow(dat)){
+  dat$YearRemodAdd.deca[i] <- floor_decade(dat$YearRemodAdd[i])
+}
+
+
+summary(dat$YearRemodAdd.deca)
+
+dat %>% 
+  filter(!is.na(SalePrice)) %>% 
+  group_by(YearRemodAdd.deca) %>% 
+  summarise(mean.grg = mean(SalePrice)) %>%
+  ggplot(aes(x=as.factor(YearRemodAdd.deca), y=mean.grg, group=1))+
+  geom_line()+
+  theme(axis.text.x = element_text(angle=90))
+
+
+
+dat <- dat %>% 
+  mutate(YearBuilt.deca = as.factor(YearBuilt.deca),
+         YearRemodAdd.deca = as.factor(YearRemodAdd.deca)) %>%
+  subset(select = -c(YearBuilt, YearRemodAdd))
+
+dat %>% colnames
+
+
+
+
+
+
+
+#YrSold and MoSold
+
+table(dat$YrSold)
+table(dat$MoSold)
+
+
+dat %>% 
+  filter(!is.na(SalePrice)) %>% 
+  group_by(YrSold) %>% 
+  summarise(mean.grg = mean(SalePrice)) %>%
+  ggplot(aes(x=as.factor(YrSold), y=mean.grg, group=1))+
+  geom_line()
+
+dat %>% 
+  filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=as.factor(YrSold), y=SalePrice, fill=as.factor(YrSold)))+
+  geom_boxplot()
+
+
+dat %>% 
+  filter(!is.na(SalePrice)) %>% 
+  group_by(MoSold) %>% 
+  summarise(mean.grg = mean(SalePrice)) %>%
+  ggplot(aes(x=as.factor(MoSold), y=mean.grg, group=1))+
+  geom_line()
+
+
+dat %>% 
+  filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=as.factor(MoSold), y=SalePrice))+
+  geom_boxplot()
+
+
+dat %>% 
+  filter(!is.na(SalePrice)) %>% mutate(MoSold = as.factor(MoSold), YrSold = as.factor(YrSold)) %>%
+  group_by(MoSold, YrSold) %>% 
+  summarise(mean.grg = mean(SalePrice)) %>%
+  ggplot(aes(x=MoSold, y=mean.grg, group=1))+
+  geom_line()+
+  facet_wrap(~YrSold)
+
+#Month..
+#12~2/ 3~5 / 6~8 / 9~11
+
+#creating Season variable
+dat$Season <- NA
+for(i in 1:nrow(dat)){
+  if(dat$MoSold[i] %in% c(12,1,2)){
+    dat$Season[i] <- "Winter"
+  }
+  if(dat$MoSold[i] %in% c(3,4,5)){
+    dat$Season[i] <- "Spring"
+  }
+  if(dat$MoSold[i] %in% c(6,7,8)){
+    dat$Season[i] <- "Summer"
+  }
+  if(dat$MoSold[i] %in% c(9,10,11)){
+    dat$Season[i] <- "Fall"
+  }
+}
+
+dat %>% 
+  filter(!is.na(SalePrice)) %>% 
+  group_by(Season) %>% 
+  summarise(mean.grg = mean(SalePrice)) %>%
+  ggplot(aes(x=Season, y=mean.grg, group=1))+
+  geom_line()
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=Season, y=SalePrice, fill=Season)) + geom_boxplot()
+
+table(dat$Season) 
+
+train.test.graph("Season", dat)
+
+#Summer has the largest number of counts 
+#spring has the smallest number of counts
+
+dat %>% select(contains("Year")) %>% str
+dat %>% select(contains("Yr")) %>% str
+dat %>% select(contains("Mo")) %>% str
+
+
+#YrSold / MoSold / Season
+#convert YrSold and MoSold -> Factor
+dat <- dat %>% 
+  mutate(YrSold = as.factor(YrSold), MoSold=as.factor(MoSold))
+
+
+dat %>% mutate_if(is.character, as.factor) %>% summary
+
+
+```
+
+Floor SF
+---------
+```{r FlrSF}
+#Floor SF
+#X1stFlrSF / X2ndFlrSF / LowQualFinSF / GrLivArea
+
+dat %>% select(X1stFlrSF, X2ndFlrSF, LowQualFinSF, GrLivArea) %>% head
+
+cor((dat$X1stFlrSF + dat$X2ndFlrSF + dat$LowQualFinSF), dat$GrLivArea)
+#X1stFlrSF + X2ndFlrSF + LowQualFinSF = GrLivArea
+
+
+train.test.graph("X1stFlrSF", dat)
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=X1stFlrSF, y=SalePrice))+geom_jitter()
+
+train.test.graph("X2ndFlrSF", dat)
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=X2ndFlrSF, y=SalePrice))+geom_jitter()
+
+
+train.test.graph("LowQualFinSF", dat)
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=LowQualFinSF, y=SalePrice))+geom_jitter()
+
+train.test.graph("GrLivArea", dat)
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=GrLivArea, y=SalePrice))+geom_jitter()
+
+
+
+sf <- dat %>% filter(!is.na(SalePrice)) %>% select(X1stFlrSF, X2ndFlrSF, LowQualFinSF, GrLivArea, SalePrice)
+
+cor(sf)
+
+
+#different shape of desnity plot for Floor SF
+#These variables might have impact on prediction 
+
+```
+
+Bath
+----------
+```{r Bath}
+dat %>% select(contains("Bath")) %>% colnames
+
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=BsmtFullBath, y=SalePrice))+
+  geom_jitter()
+
+train.test.graph("BsmtFullBath", dat)
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=BsmtHalfBath, y=SalePrice))+
+  geom_jitter()
+
+train.test.graph("BsmtHalfBath", dat)
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=FullBath, y=SalePrice))+
+  geom_jitter()
+
+
+table(dat$BsmtFullBath + dat$BsmtHalfBath)
+
+dat %>% filter(!is.na(SalePrice)) %>% mutate(bsmtbath = BsmtFullBath+BsmtHalfBath) %>%
+  ggplot(aes(x=bsmtbath, y=SalePrice))+
+  geom_jitter()
+
+#Creating BsmtBath
+#if BsmtFullBath + BsmtHalfBath = 0, then the house doesn't ahve Basement Bathroom
+#if BsmtFullBath + BsmtHalfBath != 0, otherwise
+dat$BsmtBath <- ifelse(dat$BsmtFullBath + dat$BsmtHalfBath != 0, "BsmtBath", "no BsmtBath")
+table(dat$BsmtBath)
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=BsmtBath, y=SalePrice, fill=BsmtBath)) + geom_boxplot()
+
+
+#full bath
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=FullBath, y=SalePrice)) + geom_jitter()
+
+train.test.graph("FullBath",dat)
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=HalfBath, y=SalePrice))+
+  geom_jitter()
+
+train.test.graph("HalfBath", dat)
+#Creating Total Bath
+
+
+dat %>% filter(!is.na(SalePrice)) %>% mutate(totalbath = FullBath+HalfBath) %>%
+  ggplot(aes(x=totalbath, y=SalePrice))+
+  geom_jitter()
+
+#creating Bath variable
+dat$Bath <- ifelse(dat$FullBath + dat$HalfBath>1, "more than 2 baths", "1 bath")
+table(dat$Bath)
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=Bath, y=SalePrice, fill=Bath)) + geom_boxplot()
+
+#Creating TotalBath
+dat$TotalBath <- dat$BsmtHalfBath*0.5 + dat$BsmtFullBath + dat$FullBath + dat$HalfBath*0.5
+
+train.test.graph("TotalBath", dat) #different shape
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=TotalBath, y=SalePrice)) + geom_jitter()
+
+
+bath <- dat %>% filter(!is.na(SalePrice)) %>% select(contains("bath"),SalePrice) %>% select_if(is.numeric)
+
+cor(bath)
+
+#removing TotalBath
+dat <- dat %>% subset(select=-c(TotalBath))
+
+```
+
+Bedroom
+--------
+```{r}
+#Bedroom: Bedrooms above grade (does NOT include basement bedrooms)
+#TotRmsAbvGrd: Total rooms above grade (does not include bathrooms)
+
+dat %>% select(BedroomAbvGr, TotRmsAbvGrd) %>% summary
+
+table(dat$BedroomAbvGr)
+table(dat$TotRmsAbvGrd)
+
+dat %>%
+  ggplot(aes(x=BedroomAbvGr, y=TotRmsAbvGrd))+
+  geom_jitter()
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=BedroomAbvGr, y=SalePrice))+
+  geom_jitter()
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=TotRmsAbvGrd, y=SalePrice))+
+  geom_jitter()
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  mutate(totalrooms = BedroomAbvGr + TotRmsAbvGrd) %>%
+  ggplot(aes(x=totalrooms, y=SalePrice))+
+  geom_jitter()
+
+dat <- dat %>% 
+  mutate(totalrooms = BedroomAbvGr + TotRmsAbvGrd)
+
+train.test.graph("totalrooms", dat)
+#Quite different shape
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=totalrooms, y=SalePrice)) + geom_jitter()
+
+rooms <- dat %>% filter(!is.na(SalePrice)) %>% select(BedroomAbvGr, TotRmsAbvGrd, totalrooms, SalePrice)
+
+cor(rooms)
+
+#may not need totalrooms
+
+dat <- dat %>% subset(select = -c(totalrooms))
+```
+
+```{r FlrBathBed}
+#I would combine Floor SF / Bath / Bedrooms 
+#These are all important to predict Sale Price
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=GrLivArea, y=SalePrice))+
+  geom_jitter()
+
+#Since these variables are highly correlated to each other
+#some of these are removed because of multicollinearity
+#I will combine these to not lose any information
+
+
+#log transformation on GrLivArea to make variance similar
+dat %>% filter(!is.na(SalePrice)) %>% mutate(GrLivArea = log(GrLivArea+1))%>%
+  ggplot(aes(x=GrLivArea, y=SalePrice))+
+  geom_jitter()
+
+
+
+```
+
+
+
+
+Foundation
+----------
+```{r Foundation}
+dat %>% select(Foundation) %>% summary
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=Foundation, y=SalePrice, fill=Foundation))+
+  geom_boxplot()
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(Foundation) %>%
+  summarise(count = n(),
+            mean = mean(SalePrice),
+            median = median(SalePrice),
+            sd = sd(SalePrice))
+
+dat %>% filter(is.na(SalePrice)) %>% group_by(Foundation) %>% tally()
+dat %>% filter(!is.na(SalePrice)) %>% group_by(Foundation) %>% tally()
+
+train.test.graph("Foundation", dat)
+
+dat$Foundation.new <- ifelse(dat$Foundation == "PConc", "high", "low")
+table(dat$Foundation.new)
+
+dat %>% filter(!is.na(SalePrice)) %>% 
+  ggplot(aes(x=Foundation.new, y=SalePrice, fill=Foundation.new)) + geom_boxplot()
+
+
+```
+
+Lot
+------------
+```{r Lot}
+dat %>% select(contains("Lot")) %>% summary
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=LotFrontage, y=SalePrice)) +
+  geom_jitter()
+
+dat %>% 
+  ggplot(aes(x=LotFrontage)) +
+  geom_density()
+
+dat$LotFrontage[dat$LotFrontage > 200]
+
+#replace outlier
+#dat$LotFrontage[dat$LotFrontage > 200] <- sample(180:200, 2)
+
+train.test.graph("LotFrontage", dat %>% filter(LotFrontage < 300))
+
+#LotArea
+dat %>% ggplot(aes(x=LotArea))+
+  geom_density()
+#Heavily skewed distribution
+
+dat %>% filter(!is.na(SalePrice) & LotArea < 60000) %>%
+  ggplot(aes(x=LotArea, y=SalePrice))+
+  geom_jitter()
+
+which(dat$LotArea[!is.na(dat$SalePrice)] > 60000)
+which(dat$LotArea[is.na(dat$SalePrice)] > 60000)
+
+train.test.graph("LotArea", dat %>% filter(LotArea < 60000))
+
+dat %>% filter(!is.na(SalePrice)) %>% select(LotArea) %>% summary
+dat %>% filter(is.na(SalePrice)) %>% select(LotArea) %>% summary
+
+
+dat %>% filter(!is.na(SalePrice) & LotArea > 60000)
+
+mean(dat$SalePrice, na.rm=TRUE)
+
+#We might have to deal with this outliers
+
+
+#LotShape
+
+dat %>% filter(!is.na(SalePrice))%>%
+  ggplot(aes(x=LotShape, y=SalePrice, fill=LotShape))+
+  geom_boxplot()
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(LotShape) %>% summarise(count = n(),
+                                   mean = mean(SalePrice),
+                                   median = median(SalePrice),
+                                   sd = sd(SalePrice))
+#IR1 ~= IR2 ~= IR3 
+#Irregular lotshape are more expensive 
+#regular cheaper
+
+dat %>% filter(is.na(SalePrice)) %>% group_by(LotShape) %>% tally()
+dat %>% filter(!is.na(SalePrice)) %>% group_by(LotShape) %>% tally()
+
+#combine IR <- IR1 , IR2, IR3
+
+dat$LotShape <- as.character(dat$LotShape)
+dat$LotShape[dat$LotShape == "IR1"] <- "IR"
+dat$LotShape[dat$LotShape == "IR2"] <- "IR"
+dat$LotShape[dat$LotShape == "IR3"] <- "IR"
+
+table(dat$LotShape)
+
+train.test.graph("LotShape", dat)
+
+#LotConfig
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=LotConfig, y=SalePrice, fill=LotConfig)) + 
+  geom_boxplot()
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(LotConfig) %>% summarise(count = n(),
+                                    mean = mean(SalePrice),
+                                    median = median(SalePrice),
+                                    sd = sd(SalePrice))
+
+dat %>% filter(is.na(SalePrice)) %>% group_by(LotConfig) %>% tally()
+dat %>% filter(!is.na(SalePrice)) %>% group_by(LotConfig) %>% tally()
+
+dat$LotConfig[dat$LotConfig == "FR3"] <- "FR2"
+
+train.test.graph("LotConfig",dat)
+
+table(dat$LotConfig)
+```
+
+Kitchen
+-----------
+```{r Kitchen}
+
+dat %>% select(contains("Kitchen")) %>% summary
+
+dat %>% ggplot(aes(x=KitchenAbvGr)) + geom_density()
+
+dat %>% ggplot(aes(x=as.factor(KitchenAbvGr), fill=as.factor(KitchenAbvGr))) + geom_bar()
+
+table(dat$KitchenAbvGr)
+
+dat %>% filter(!is.na(SalePrice)) %>% ggplot(aes(x=KitchenAbvGr, y=SalePrice)) + geom_jitter()
+
+dat %>% filter(!is.na(SalePrice)) %>% 
+  group_by(KitchenAbvGr) %>% 
+  summarise(count = n(),
+            mean = mean(SalePrice),
+            median = median(SalePrice),
+            sd = sd(SalePrice))
+
+
+dat %>% filter(is.na(SalePrice)) %>% 
+  group_by(KitchenAbvGr) %>% tally()
+
+train.test.graph("KitchenAbvGr", dat)
+
+#Notice Test set doesn't have 3 kitchenAbvGr
+#And 0 KitchenAbvGr is recorded only 1 or 2 in train and test dataset
+#I will combine 
+#0 -> 1
+#3 -> 2
+
+dat$KitchenAbvGr[dat$KitchenAbvGr == 0] <- 1
+dat$KitchenAbvGr[dat$KitchenAbvGr == 3] <- 2
+
+train.test.graph("KitchenAbvGr", dat)
+
+dat$isKitchen <- ifelse(dat$KitchenAbvGr == 1, "1 kitchen", "2 kitchens")
+
+table(dat$isKitchen)
+
+dat %>% filter(!is.na(SalePrice)) %>% 
+  ggplot(aes(x=isKitchen, y=SalePrice, fill=isKitchen)) + geom_boxplot()
+
+dat <- dat%>% subset(select=-c(KitchenAbvGr))
+
+#Too skewed
+
+
+#kitchen qual
+table(dat$KitchenQual)
+
+kit.qual <- c("Ex" = 5, 
+          "Gd"= 4, 
+          "TA" = 3, 
+          "Fa" = 2, 
+          "Po" = 1)
+
+
+dat %>% ggplot(aes(x=KitchenQual, fill=KitchenQual)) + geom_bar()
+
+dat %>% filter(!is.na(SalePrice)) %>% 
+  ggplot(aes(x=KitchenQual, y=SalePrice, fill=KitchenQual)) + geom_boxplot()
+
+dat %>% filter(!is.na(SalePrice)) %>% 
+  group_by(KitchenQual) %>% summarise(count = n(),
+                                      mean = mean(SalePrice),
+                                      median = median(SalePrice),
+                                      sd = sd(SalePrice))
+
+dat %>% filter(is.na(SalePrice)) %>% group_by(KitchenQual) %>% tally()
+
+train.test.graph("KitchenQual", dat)
+
+dat$KitchenQual <- ordTonum(dat$KitchenQual, kit.qual)
+
+```
+
+Fireplace
+------------
+```{r FirePlace}
+dat %>% select(contains("Fire")) %>% summary
+
+dat %>% filter(!is.na(SalePrice)) %>% 
+  ggplot(aes(x=as.factor(Fireplaces), y=SalePrice, fill=as.factor(Fireplaces))) + geom_boxplot()
+
+table(dat$Fireplaces)
+
+dat %>% mutate(Fireplaces = as.factor(Fireplaces)) %>% filter(!is.na(SalePrice)) %>% 
+  group_by(Fireplaces) %>% summarise(count = n(),
+                                     mean = mean(SalePrice),
+                                     median = median(SalePrice),
+                                     sd = sd(SalePrice))
+
+dat %>% mutate(Fireplaces = as.factor(Fireplaces)) %>% filter(is.na(SalePrice)) %>% 
+  group_by(Fireplaces) %>% tally()
+
+dat %>% mutate(Fireplaces = as.factor(Fireplaces)) %>% filter(!is.na(SalePrice)) %>% 
+  group_by(Fireplaces) %>% tally()
+
+train.test.graph("Fireplaces", dat)
+
+#convert fireplaces -> factor
+
+dat$isFireplaces <- as.factor(ifelse(dat$Fireplaces == 0, "no fireplace", "Fireplaces"))
+
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=isFireplaces, y=SalePrice, fill=isFireplaces)) + geom_boxplot()
+
+
+#FireplaceQu
+
+dat %>% filter(!is.na(SalePrice)) %>% 
+  ggplot(aes(x=FireplaceQu, y=SalePrice, fill=FireplaceQu))+geom_boxplot()
+
+dat %>% filter(!is.na(SalePrice)) %>% group_by(FireplaceQu) %>%
+  summarise(count = n(),
+            mean = mean(SalePrice),
+            median = median(SalePrice),
+            sd = sd(SalePrice))
+
+dat %>% filter(is.na(SalePrice)) %>% group_by(FireplaceQu) %>% tally()
+dat %>% filter(!is.na(SalePrice)) %>% group_by(FireplaceQu) %>% tally()
+
+
+train.test.graph("FireplaceQu", dat)
+
+
+table(dat$FireplaceQu)
+
+fire.qual <- c("Ex" = 5, 
+          "Gd"= 4, 
+          "TA" = 3, 
+          "Fa" = 2, 
+          "Po" = 1, 
+          "no fireplace" = 0)
+
+table(ordTonum(dat$FireplaceQu, fire.qual))
+
+dat$FireplaceQu <- ordTonum(dat$FireplaceQu, fire.qual)
+
+```
+
+MSZoning
+----------
+```{r MSZoning}
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=MSZoning, y=SalePrice, fill=MSZoning)) + geom_boxplot()
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(MSZoning) %>% summarise(count = n(),
+                                   mean = mean(SalePrice),
+                                   median = median(SalePrice),
+                                   sd = sd(SalePrice))
+dat %>% filter(is.na(SalePrice)) %>%
+  group_by(MSZoning) %>% tally()
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(MSZoning) %>% tally()
+
+#Combine factors
+
+dat$MSZoning.new <- as.factor(ifelse(dat$MSZoning %in% c("FV", "RL"), "FV + RL", "Others"))
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=MSZoning.new, y=SalePrice, fill=MSZoning.new)) + geom_boxplot()
+
+train.test.graph("MSZoning", dat)
+
+table(dat$MSZoning)
+
+msz.qual <- c("FV" = 5,
+              "RL" = 4,
+              "RM" = 3,
+              "RH" = 2,
+              "C (all)" = 1)
+
+table(ordTonum(dat$MSZoning, msz.qual))
+
+dat$MSZoning <- ordTonum(dat$MSZoning, msz.qual)
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=MSZoning, y=SalePrice)) + geom_jitter()
+
+```
+
+Neighborhood
+-------------
+```{r Neighborhood}
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=Neighborhood, y=SalePrice, fill=Neighborhood))+
+  geom_boxplot()+
+  theme(axis.text.x = element_text(angle=90))
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(Neighborhood) %>% summarise(count = n(),
+                                       mean = mean(SalePrice),
+                                       median = median(SalePrice),
+                                       sd = sd(SalePrice))
+
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(Neighborhood) %>%
+  summarise(count = n(),
+            mean = mean(SalePrice),
+            median = median(SalePrice),
+            sd = sd(SalePrice)) %>%
+  ggplot(aes(x=reorder(Neighborhood, count), y=count, fill=Neighborhood))+
+  geom_bar(stat="identity")+
+  theme(axis.text.x = element_text(angle=90))+
+  ggtitle("Neighborhood by Counts")
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(Neighborhood) %>%
+  summarise(count = n(),
+            mean = mean(SalePrice),
+            median = median(SalePrice),
+            sd = sd(SalePrice)) %>% 
+  ggplot(aes(x=reorder(Neighborhood, mean), y=mean, fill=Neighborhood))+
+  geom_bar(stat="identity")+
+  theme(axis.text.x = element_text(angle=90))+
+  ggtitle("SalePrice by group mean of Neighborhood")
+  
+
+dat %>% filter(is.na(SalePrice)) %>% group_by(Neighborhood) %>% tally()
+dat %>% filter(!is.na(SalePrice)) %>% group_by(Neighborhood) %>% tally()
+
+train.test.graph("Neighborhood", dat)
+
+neigh <- data.frame(dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(Neighborhood) %>%
+  summarise(count = n(),
+            mean = mean(SalePrice),
+            median = median(SalePrice),
+            sd = sd(SalePrice)) %>% arrange(mean))
+
+neigh <- neigh %>% mutate_if(is.factor, as.character)
+neigh
+
+
+neigh.1 <-neigh$Neighborhood[neigh$mean < 120000]
+neigh.2 <- neigh$Neighborhood[neigh$mean > 120000 & neigh$mean < 180000]
+neigh.3 <- neigh$Neighborhood[neigh$mean > 180000 & neigh$mean < 250000]
+neigh.4 <- neigh$Neighborhood[neigh$mean > 250000]
+
+dat$neigh.group <- 
+  as.factor(ifelse(dat$Neighborhood %in% neigh.1, 1, 
+                   ifelse(dat$Neighborhood %in% neigh.2, 2,
+                          ifelse(dat$Neighborhood %in% neigh.3, 3,
+                                 ifelse(dat$Neighborhood %in% neigh.4, 4, "")))))
+
+table(dat$neigh.group)
+
+dat %>% filter(!is.na(SalePrice)) %>% 
+  ggplot(aes(x=neigh.group, y=SalePrice)) + geom_jitter()
+
+```
+
+OverallQual / OverallCond
+------------------
+```{r Overall}
+
+dat %>% select(contains("Overall")) %>% summary
+
+#OverallQual
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=as.factor(OverallQual), y=SalePrice, fill=as.factor(OverallQual))) + geom_boxplot()
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(OverallQual) %>% summarise(count = n(),
+                                      mean = mean(SalePrice),
+                                      median = median(SalePrice),
+                                      sd = sd(SalePrice))
+
+dat %>% filter(is.na(SalePrice)) %>%
+  group_by(OverallQual) %>% tally()
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(OverallQual) %>% tally()
+
+#OverallCond
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=as.factor(OverallCond), y=SalePrice, fill=as.factor(OverallCond))) + geom_boxplot()
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(OverallCond) %>% summarise(count = n(),
+                                      mean = mean(SalePrice),
+                                      median = median(SalePrice),
+                                      sd = sd(SalePrice))
+
+dat %>% filter(is.na(SalePrice)) %>%
+  group_by(OverallCond) %>% tally()
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(OverallCond) %>% tally()
+
+dat$OverallCond %>% str
+
+train.test.graph("OverallCond", dat)
+summary(dat$OverallCond)
+
+```
+
+MasVnr
+------------
+```{r MasVnr}
+
+dat %>% select(contains("MasVnr")) %>% summary
+
+
+#MasVnrType
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=MasVnrType, y=SalePrice, fill=MasVnrType)) + geom_boxplot()
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(MasVnrType) %>% summarise(count = n(),
+                                     mean = mean(SalePrice),
+                                     median = median(SalePrice),
+                                     sd = sd(SalePrice))
+
+dat %>% filter(is.na(SalePrice)) %>%
+  group_by(MasVnrType) %>% tally()
+dat %>% filter(!is.na(SalePrice)) %>%
+  group_by(MasVnrType) %>% tally()
+
+train.test.graph("MasVnrType", dat)
+
+table(dat$MasVnrType)
+
+dat$isMas <- as.factor(ifelse(dat$MasVnrType == "None", "no Mas", "Mas"))
+
+table(dat$isMas)
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=isMas, y=SalePrice, fill=isMas)) + geom_boxplot()
+
+#MasVnrArea
+
+dat %>% filter(!is.na(SalePrice)) %>%
+  ggplot(aes(x=MasVnrArea, y=SalePrice)) + geom_jitter()
+
+dat %>% ggplot(aes(x=MasVnrType, y=MasVnrArea, MasVnrType)) + geom_boxplot()
+
+dat %>% filter(MasVnrType == "None" & MasVnrArea != 0)
+
+
+#replace MasVnrArea in MasVnrType = "None" -> 0
+
+dat$MasVnrArea[dat$MasVnrType == "None" & dat$MasVnrArea != 0] <- 0
+
+
+#Again
+dat %>% filter(!is.na(SalePrice) & MasVnrType != "None") %>%
+  ggplot(aes(x=MasVnrArea, y=SalePrice)) + geom_jitter()
+
+
+dat %>% filter(MasVnrType != "None") %>%
+  ggplot(aes(x=MasVnrArea)) + geom_density(fill="blue")
+#Skewed distribution
+
+train.test.graph("MasVnrArea", dat)
+
+dat %>% filter(MasVnrArea > 1200) %>% select(SalePrice, contains("Mas"))
+#It might have to be replaced 
+dat %>% filter(MasVnrType == "BrkFace") %>% select(SalePrice, MasVnrArea, MasVnrType) %>% summary
+
+```
+
+
+Numerical predictors (skewed) -> log / sqrt / normalization(scale)
+Transformation for Numerical variables
+---------------
+```{r NumTransform, warning=FALSE}
+num.vars<- dat %>% select_if(is.numeric) %>% colnames
+num.vars
+
+#SalePrice
+dat %>% 
+  filter(!is.na(SalePrice)) %>% 
+  ggplot(aes(sample = SalePrice)) + 
+  stat_qq() + 
+  stat_qq_line()+
+  ggtitle("No Transformation")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+dat %>% 
+  filter(!is.na(SalePrice)) %>% mutate(SalePrice = log(SalePrice + 1)) %>%
+  ggplot(aes(sample = SalePrice)) + 
+  stat_qq() + 
+  stat_qq_line()+
+  ggtitle("Log Transformation")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+dat %>% 
+  filter(!is.na(SalePrice)) %>% mutate(SalePrice = scale(SalePrice, center=TRUE, scale=FALSE)) %>%
+  ggplot(aes(sample = SalePrice)) + 
+  stat_qq() + 
+  stat_qq_line()+
+  ggtitle("zscale Normalization")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+dat %>% 
+  filter(!is.na(SalePrice)) %>% mutate(SalePrice = sqrt(SalePrice)) %>%
+  ggplot(aes(sample = SalePrice)) + 
+  stat_qq() + 
+  stat_qq_line()+
+  ggtitle("Square Root Transformation")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+#find best transformation method with skewness and kurtosis
+#skewness and kurtosis cutoffs
+#skewness -> +/- 1
+#kurtosis -> +/- 3
+#both closer to zero, more normalized ditributed
+
+
+skewness(dat$SalePrice[!is.na(dat$SalePrice)])
+
+dat %>% 
+  filter(!is.na(SalePrice)) %>% mutate(SalePrice = sqrt(SalePrice)) %>%
+  summarise(skew = skewness(SalePrice), kurt = kurtosis(SalePrice))
+
+#Log transformation function
+log.func <- function(var){
+  return(log(var+1))
+}
+
+#Z-score transformation
+scale.func <- function(var){
+  return(scale(var, center=TRUE, scale=TRUE))
+}
+
+#Min-Max transformation
+minmax.func <- function(var){
+  return((var-min(var))/(max(var)-min(var)))
+}
+
+
+skew.kurt.testFunc <- function(var, data){
+  
+  test.var <- data[!is.na(data[,var]),var]
+  
+  skew.kurt.data <- data.frame(skew = skewness(test.var),
+                               kurt = kurtosis(test.var))
+  
+  skew.kurt.data.log <- data.frame(skew = skewness(log.func(test.var)),
+                               kurt = kurtosis(log.func(test.var)))
+  
+  skew.kurt.data.zscore <- data.frame(skew = skewness(scale.func(test.var)),
+                               kurt = kurtosis(scale.func(test.var)))
+  
+  skew.kurt.data.minmax <- data.frame(skew = skewness(minmax.func(test.var)),
+                               kurt = kurtosis(minmax.func(test.var)))
+  
+  skew.kurt.data.sqrt <- data.frame(skew = skewness(sqrt(test.var)),
+                               kurt = kurtosis(sqrt(test.var)))
+  
+  skew.kurt.final <- rbind(skew.kurt.data,
+                           skew.kurt.data.log,
+                           skew.kurt.data.zscore,
+                           skew.kurt.data.minmax,
+                           skew.kurt.data.sqrt)
+  
+  skew.kurt.final$transformation <- c("original", "log", "zscore", "minmax", "sqrt")
+  
+  return(skew.kurt.final)
+  
+}
+
+
+skew.kurt.testFunc("SalePrice", dat)
+
+#But, Let's try boxcox transformation for numerical variables
+
+
+bc <- BoxCoxTrans(dat$SalePrice, na.rm=TRUE)
+bc
+
+predict(bc,dat$SalePrice) %>% head
+
+bc.func <- function(vars,data){
+  bc <- BoxCoxTrans(data[,vars], na.rm=TRUE)
+  return(bc)
+}
+
+bc.func("SalePrice", dat)
+bc.func("SalePrice", dat)$lambda
+#returns the optimal lambda
+#in this case, saleprice will be log transformed since lambda is -0.1
+
+
+
+
+
+#creating new data to transform numerical variables
+trans.dat <- dat
+
+trans.dat %>% select_if(is.numeric) %>% colnames
+
+
+
+#adding 1 for boxcox transformation (It contains log transforamtion)
+trans.dat <- trans.dat %>% mutate_if(is.numeric, function(x){x+1})
+
+num.vars<- trans.dat %>% select_if(is.numeric) %>% colnames
+num.vars
+
+trans.dat1 <- trans.dat
+#boxcox transfomration applied
+#some of variables are not able to be boxcox transformed since the estimated lambda not calculated
+#those variables are transformed by log or normal transformation
+for(i in num.vars){
+  lambda<-bc.func(i, trans.dat)$lambda
+  if(!is.na(lambda)){
+    trans.dat[,i] <- predict(bc.func(i, trans.dat), trans.dat[,i])
+    if(trans.dat[,i] == trans.dat1[,i]){
+      print(paste0(i, " has not been trasnformed"))
+    }
+  }
+  if(is.na(lambda)){
+    print(i)
+  }
+}
+
+skew.kurt.testFunc("TotalBsmtSF", trans.dat) #sqrt transformation will be the best
+skew.kurt.testFunc("BedroomAbvGr", trans.dat) #sqrt
+skew.kurt.testFunc("GarageArea", trans.dat) #zscore
+
+
+#TotalBsmtSF
+#BedroomAbvGr
+#GarageArea
+
+trans.dat <- trans.dat %>% mutate(TotalBsmtSF = sqrt(TotalBsmtSF),
+                                  BedroomAbvGr = sqrt(BedroomAbvGr),
+                                  GarageArea = scale.func(GarageArea))
+
+
+
+
+trans.dat %>% select_if(is.numeric) %>% summary
+
+
+#quick lm
+
+lm1 <- lm(SalePrice ~.,
+          data = trans.dat %>% filter(!is.na(SalePrice)))
+
+
+par(mfrow=c(2,2))
+plot(lm1)
+par(mfrow=c(1,1))
+#not plotting observations will have only one levels to not be able to compare with others obs
+
+#index 524 and 1299 must be outliers
+
+#There are several ways to see outliers in our model
+outlierTest(lm1,n.max=50,cutoff=0.05)
+
+influencePlot(lm1,id.method="identify",main="influential plot",sub="circle size is proportial to cook's distance")
+
+#However,
+#I'm using Standardized Residuals to detect outliers
+
+#from Springers Text book "Linear Regression"
+
+#"In summary, an outlier is a point whose standardized residual falls outside the interval from -2 to 2. 
+#Recall that a bad leverage point is a leverage point which is also an outlier. Thus, a bad leverage point is a leverage point whose standardized residual falls outside the interval from -2 to 2."
+
+#However, I used -4 and 4 because of the size of dataset
+o1<-which(rstandard(lm1, infl = lm.influence(lm1, do.coef = FALSE),
+                    sd=sqrt(deviance(lm1)/df.residual(lm1)),
+                    type=c("sd.1","predictive"))>4)
+
+o2<-which(rstandard(lm1, infl = lm.influence(lm1, do.coef = FALSE),
+                    sd=sqrt(deviance(lm1)/df.residual(lm1)),
+                    type=c("sd.1","predictive"))<(-4))
+
+
+outliers <- c(o1,o2)
+length(outliers)
+
+outliers
+
+
+trans.dat <- trans.dat[-outliers,]
+
+#outlier again
+#quick lm
+
+lm1 <- lm(SalePrice ~.,
+          data = trans.dat %>% filter(!is.na(SalePrice)))
+
+
+o1<-which(rstandard(lm1, infl = lm.influence(lm1, do.coef = FALSE),
+                    sd=sqrt(deviance(lm1)/df.residual(lm1)),
+                    type=c("sd.1","predictive"))>4)
+
+o2<-which(rstandard(lm1, infl = lm.influence(lm1, do.coef = FALSE),
+                    sd=sqrt(deviance(lm1)/df.residual(lm1)),
+                    type=c("sd.1","predictive"))<(-4))
+
+
+outliers <- c(o1,o2)
+length(outliers)
+
+outliers
+
+trans.dat <- trans.dat[-outliers,]
+
+
+
+
+
+
+
+
+
+trans.dat %>% select_if(is.numeric) %>% colnames
+
+#After seeing some predictors if they have outliers in test set..
+#totalbsmtSF
+
+train.test.graph("LotFrontage", trans.dat)
+
+
+trans.dat %>% filter(!is.na(SalePrice) & LotFrontage > 40) %>% dim
+trans.dat %>% filter(is.na(SalePrice) & LotFrontage > 40) %>% dim
+
+trans.dat$LotFrontage[trans.dat$LotFrontage > 40] <- 
+  max(trans.dat$LotFrontage[is.na(trans.dat$SalePrice)])
+
+train.test.graph("LotFrontage", trans.dat)
+
+train.test.graph("LotArea", trans.dat)
+
+#replace max value in training as max value in test set
+trans.dat$LotArea[!is.na(trans.dat$SalePrice) & trans.dat$LotArea >max(trans.dat$LotArea[is.na(trans.dat$SalePrice)]) ] <- max(trans.dat$LotArea[is.na(trans.dat$SalePrice)])
+
+
+train.test.graph("TotalBsmtSF", trans.dat)
+
+
+trans.dat$TotalBsmtSF[is.na(trans.dat$SalePrice) & trans.dat$TotalBsmtSF>60]
+#replace max value in test set as max value in training set
+trans.dat$TotalBsmtSF[is.na(trans.dat$SalePrice) & trans.dat$TotalBsmtSF>60] <- max(trans.dat$TotalBsmtSF[!is.na(trans.dat$SalePrice)])
+
+
+train.test.graph("TotalBsmtSF", trans.dat)
+
+
+```
+
+
+Factor variables
+----------------
+```{r notimpfac}
+
+dat.prc <- trans.dat
+dat.prc %>% str
+
+#Factor Variables mostly skewed
+
+fac.vars <- trans.dat %>% select_if(is.factor) %>% colnames
+
+not.imp.fac <- NULL
+for(i in fac.vars){
+  if(any(prop.table(matrix(table(trans.dat[,i]))) > 0.95)){
+    not.imp.fac <- c(not.imp.fac, i)
+  }
+}
+
+
+#Let's remove insignificant or independent factor predictors with response
+not.imp.fac
+
+
+dat.prc <- trans.dat[,!colnames(trans.dat) %in% not.imp.fac]
+
+
+
+trans.dat <- dat.prc
+
+trans.dat %>% dim
+
+```
+
+
+
+Categorical predictors -> dummy variables , Dummy - one hot encoding
+------------------
+```{r OneHot}
+#Splitting numerical variable and factor variables to make dummy variables
+num.trans.dat <- trans.dat %>% select_if(is.numeric)
+fac.trans.dat <- trans.dat %>% select_if(is.factor)
+
+
+fac.var <- fac.trans.dat %>% colnames
+
+#creating formula
+formula.dummy <- as.formula(paste("~", paste(fac.var, collapse = "+")))
+
+dummies <- dummyVars(formula.dummy, data=fac.trans.dat)
+
+dummies.pred <- predict(dummies, fac.trans.dat)
+
+fac.trans.dummies.dat <- cbind(fac.trans.dat, dummies.pred)
+
+fac.trans.dummies.dat <- fac.trans.dummies.dat[,!colnames(fac.trans.dummies.dat) %in% fac.var]
+
+dim(fac.trans.dummies.dat)
+
+#If column sum is 0, then either train or test set doesn't have a value
+which(colSums(fac.trans.dummies.dat[!is.na(trans.dat$SalePrice),])==0)
+
+fac.trans.dummies.dat <- fac.trans.dummies.dat[,which(colSums(fac.trans.dummies.dat[!is.na(trans.dat$SalePrice),])!=0)]
+
+which(colSums(fac.trans.dummies.dat[is.na(trans.dat$SalePrice),])==0)
+
+fac.trans.dummies.dat <- fac.trans.dummies.dat[,which(colSums(fac.trans.dummies.dat[is.na(trans.dat$SalePrice),])!=0)]
+
+fac.trans.dummies.dat %>% dim
+
+
+#Combine
+comb.trans.dat <- cbind(num.trans.dat, fac.trans.dummies.dat)
+
+comb.trans.dat %>% dim
+
+
+training <- comb.trans.dat %>% filter(!is.na(SalePrice))
+testing <- comb.trans.dat %>% filter(is.na(SalePrice))
+
+training %>% dim
+testing %>% dim
+
+which(colSums(training) ==0)
+which(colSums(testing) ==0)
+
+
+
+```
+
+Caret - Cross Validation, Creating useful function for modeling
+---------------------
+```{r modeling / accuracy / trainControl function}
+#creating function for Caret modeling
+
+model <- function(method, training, control,grid,...){
+
+  if(is.null(grid)){
+    model.fit <- train(SalePrice~.,
+                     data = training,
+                     method = method,
+                     trControl = control,
+                     ...)
+    return(model.fit)
+  }
+
+  else{
+    model.fit <- train(SalePrice~.,
+                     data = training,
+                     method = method,
+                     trControl = control,
+                     tuneGrid = grid,
+                     ...)
+    return(model.fit)
+  }
+}
+
+
+#10 folds cv
+control <- trainControl(method = "cv", number = 10)
+
+```
+
+
+
+Modeling and Bootstrapping for final prediction and averaging them (Soft Voting)
+------------
+```{r modeling}
+training %>% dim
+
+#I will use Ridge / Lasso / Elastic Net / XGBoost
+#creating functions to fit the each algorithms
+
+lambda <- seq(0.001,0.1,by = 0.0001)
+
+ridge.func <- function(train, test){
+  ridgeGrid <- expand.grid(alpha = 0, lambda = lambda) #ridge: alpha = 0
+  ridge.model <- model("glmnet", train, control, ridgeGrid)
+  ridge.final.pred <- exp(predict(ridge.model, test))
+  return(ridge.final.pred)
+}
+
+lasso.func <- function(train,test){
+  lassoGrid <- expand.grid(alpha = 1, lambda = lambda)
+  lasso.model <- model("glmnet", train, control, lassoGrid)
+  lasso.final.pred <- exp(predict(lasso.model,test))
+  return(lasso.final.pred)
+}
+
+elastic.func <- function(train,test){
+  elastic.model <- model("glmnet", training, control, grid=NULL, tuneLength = 10)
+  elastic.final.pred <- exp(predict(elastic.model, testing))
+  return(elastic.final.pred)
+}
+
+
+
+
+
+control <- trainControl(method = "cv", number = 10)
+
+#Grid Search
+xgb.grid <- expand.grid(nrounds = 1000, #boosting iterations
+                        eta = c(0.01, 0.1, 0.4), #Shrinkage
+                        max_depth = c(1,2,3), #max tree depth
+                        gamma = c(0,0.01, 0.1), #minimum loss reduction
+                        colsample_bytree = c(0.5, 1), #subsample ratio of columns
+                        min_child_weight = c(1, 3), #minimum sum of instance weight
+                        subsample = c(0.5, 0.8)) #subsample percentage
+
+#This takes long time, so I will skip this process
+#xgb.model <- model("xgbTree", training, control, grid = xgb.grid)
+
+#xgb.model
+
+#xgb.model$bestTune
+
+#min(xgb.model$results$RMSE)
+#As the result of cv score, the parameter has been set as the below
+
+
+label_train <- training$SalePrice
+# put our testing & training data into two seperates Dmatrixs objects
+dtrain <- xgb.DMatrix(data = as.matrix(training %>% subset(select=-c(SalePrice))), label= label_train)
+dtest <- xgb.DMatrix(data = as.matrix(testing %>% subset(select = -c(SalePrice))))
+
+#Parameter from CV above
+default_param<-list(
+  objective = "reg:linear",
+  booster = "gbtree",
+        eta=0.1, #default = 0.3
+        gamma=0,
+        max_depth=2, #default=6
+        min_child_weight=1, #default=1
+        subsample=0.8,
+        colsample_bytree=0.5)
+
+
+xgb.func <- function(train, test){
+  xgbcv <- xgb.cv(params = default_param, 
+                 data = train, nrounds = 1000, 
+                 nfold = 10, 
+                 showsd = T, 
+                 stratified = T, 
+                 print_every_n = 40, 
+                 early_stopping_rounds = 50, 
+                 maximize = F)
+  xgb_mod <- xgb.train(data = train, params=default_param, nrounds = xgbcv$best_iteration)
+
+  xgb.final.pred <- exp(predict(xgb_mod, test))
+}
+
+
+
+#Creating dataset to average the predicted values
+#I will perform each algorithms 10 times and average the results
+boot.dat <- as.data.frame(matrix(data = NA, 
+                                   nrow=length(testing$SalePrice),
+                                   ncol=10, 
+                                   dimnames = list(c(1:length(testing$SalePrice)),c(1:10))))
+
+for(i in 1:10){
+  ridge <- ridge.func(training, testing)
+  lasso <- lasso.func(training, testing)
+  elastic <- elastic.func(training, testing)
+  xgb <- xgb.func(dtrain, dtest)
+  
+  softVoting <- (ridge+lasso+elastic+xgb)/4
+  
+  boot.dat[,i] <- softVoting
+}
+
+
+#averaging them
+real.pred <- apply(boot.dat, 1, mean)
+
+
+#Creating submission
+submission <- data.frame(Id = test$Id, SalePrice = real.pred)
+
+submission %>% head
+
+#write.csv(submission, "C:/Users/husie/Desktop/Kaggle/House Price/final 45.csv", row.names = FALSE)
+
+
+```
+
+
+
